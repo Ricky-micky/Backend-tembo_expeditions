@@ -1,18 +1,24 @@
 import os
 
 class Config:
-    SECRET_KEY = os.environ.get('SECRET_KEY', 'fallback-secret-key')
+    SECRET_KEY = os.environ.get('SECRET_KEY', 'fallback-secret-key-change-this')
     
-    # Render/Railway give "postgres://" but SQLAlchemy requires "postgresql://"
     _db_url = os.environ.get('DATABASE_URL', 'sqlite:///joztembo.db')
+    
+    # Fix for Render/Heroku URLs
     if _db_url.startswith('postgres://'):
         _db_url = _db_url.replace('postgres://', 'postgresql://', 1)
         
+    # CRITICAL FIX: Force SQLAlchemy to use psycopg2
+    if _db_url.startswith('postgresql://'):
+        _db_url = _db_url.replace('postgresql://', 'postgresql+psycopg2://', 1)
+        
     SQLALCHEMY_DATABASE_URI = _db_url
     SQLALCHEMY_TRACK_MODIFICATIONS = False
+    
     SQLALCHEMY_ENGINE_OPTIONS = {
         'pool_pre_ping': True, 
-        'pool_recycle': 280, # Recycle connections before Supabase drops them
+        'pool_recycle': 280, 
     }
 
     JWT_EXPIRATION_HOURS = 168
