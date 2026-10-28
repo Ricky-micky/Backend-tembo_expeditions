@@ -1,8 +1,6 @@
-# config.py
 import os
 
 class Config:
-    # Pulls from .env, with a safe fallback just in case
     SECRET_KEY = os.environ.get('SECRET_KEY', 'fallback-secret-key')
     
     # Render/Railway give "postgres://" but SQLAlchemy requires "postgresql://"
@@ -13,7 +11,8 @@ class Config:
     SQLALCHEMY_DATABASE_URI = _db_url
     SQLALCHEMY_TRACK_MODIFICATIONS = False
     SQLALCHEMY_ENGINE_OPTIONS = {
-        'pool_pre_ping': True, # Keeps connection alive on Render
+        'pool_pre_ping': True, 
+        'pool_recycle': 280, # Recycle connections before Supabase drops them
     }
 
     JWT_EXPIRATION_HOURS = 168
@@ -23,7 +22,6 @@ class Config:
     ALLOWED_IMAGE_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'tiff', 'ico'}
     ALLOWED_VIDEO_EXTENSIONS = {'mp4', 'avi', 'mov', 'wmv', 'flv', 'mkv', 'webm', 'm4v', '3gp'}
 
-    # Mail Settings (Protected in .env)
     MAIL_SERVER = os.environ.get('MAIL_SERVER', 'smtp.gmail.com')
     MAIL_PORT = int(os.environ.get('MAIL_PORT', 587))
     MAIL_USE_TLS = os.environ.get('MAIL_USE_TLS', 'True').lower() == 'true'
