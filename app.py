@@ -4,12 +4,17 @@ from flask_mail import Mail, Message
 from flask_cors import CORS
 from datetime import datetime, timezone, timedelta
 from functools import wraps
+from dotenv import load_dotenv
 import os
 import logging
 import re
 import jwt
 import uuid
 import mimetypes
+from urllib.parse import urlparse
+from html import escape
+import cloudinary
+import cloudinary.uploader
 from werkzeug.utils import secure_filename
 from logging.handlers import RotatingFileHandler
 
@@ -30,9 +35,11 @@ from models import (
 UTC = timezone.utc
 MAX_EXCURSION_MEDIA = 4
 
-# ============================================================
-# CORS SETTINGS (Ensures Mobile & Vercel can connect)
-# ============================================================
+# ⚠️ REPLACE THIS with a real URL where your logo is hosted.
+# For now, I am using a placeholder safari image so it renders correctly.
+# Example: "https://yourwebsite.com/uploads/branding/logo.png"
+LOGO_URL = "https://temboexpedition.vercel.app/joz-logo.png" 
+
 def _parse_origins():
     raw = os.environ.get('ALLOWED_ORIGINS', '')
     origins = [o.strip() for o in raw.split(',') if o.strip()]
@@ -53,8 +60,48 @@ def _cors_regex():
     return r'^(' + '|'.join(escaped) + r')$'
 
 # ============================================================
-# APP FACTORY
+# HTML EMAIL TEMPLATE HELPER
 # ============================================================
+def generate_email_template(title, content_html, footer_message="Joz Tembo Tours & Safari"):
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <style>
+            body {{ font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; background-color: #f4f4f4; margin: 0; padding: 20px; color: #333; }}
+            .container {{ max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
+            .header {{ background-color: #1a1a1a; padding: 25px 20px; text-align: center; }}
+            .header img {{ max-height: 90px; width: auto; }}
+            .header h1 {{ color: #ffffff; margin: 15px 0 0 0; font-size: 22px; font-weight: 500; letter-spacing: 1px; }}
+            .content {{ padding: 30px; line-height: 1.6; font-size: 15px; }}
+            .highlight-box {{ background-color: #f8f9fa; border-left: 4px solid #d4af37; padding: 15px; margin: 20px 0; border-radius: 4px; }}
+            .highlight-box strong {{ color: #1a1a1a; }}
+            .footer {{ background-color: #f8f9fa; padding: 20px; text-align: center; font-size: 12px; color: #666; border-top: 1px solid #eeeeee; }}
+            .footer img {{ max-height: 50px; opacity: 0.7; margin-bottom: 10px; }}
+            .btn {{ display: inline-block; padding: 10px 20px; background-color: #d4af37; color: #ffffff; text-decoration: none; border-radius: 4px; font-weight: bold; margin-top: 15px; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <img src="{LOGO_URL}" alt="Joz Tembo Tours Logo">
+                <h1>{title}</h1>
+            </div>
+            <div class="content">
+                {content_html}
+            </div>
+            <div class="footer">
+                <img src="{LOGO_URL}" alt="Joz Tembo Tours">
+                <p>{footer_message}<br>
+                Thank you for choosing us!<br>
+                &copy; {datetime.now().year} Joz Tembo Tours. All rights reserved.</p>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
 def create_app(config_class=None):
     app = Flask(__name__)
 
@@ -72,23 +119,30 @@ def create_app(config_class=None):
     app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', app.config.get('SECRET_KEY'))
     app.config['JWT_EXPIRATION_HOURS'] = 168
 
-    app.config['MAIL_SERVER'] = os.environ.get('MAIL_SERVER', app.config.get('MAIL_SERVER'))
-    app.config['MAIL_PORT'] = int(os.environ.get('MAIL_PORT', app.config.get('MAIL_PORT', 587)))
-    app.config['MAIL_USE_TLS'] = os.environ.get('MAIL_USE_TLS', 'True').lower() == 'true'
-    app.config['MAIL_USE_SSL'] = os.environ.get('MAIL_USE_SSL', 'False').lower() == 'true'
-    app.config['MAIL_USERNAME'] = os.environ.get('MAIL_USERNAME', app.config.get('MAIL_USERNAME'))
-    app.config['MAIL_PASSWORD'] = os.environ.get('MAIL_PASSWORD', app.config.get('MAIL_PASSWORD'))
-    app.config['MAIL_DEFAULT_SENDER'] = os.environ.get('MAIL_DEFAULT_SENDER', app.config.get('MAIL_USERNAME'))
-    app.config['MAIL_ADMIN_RECIPIENT'] = os.environ.get('MAIL_ADMIN_RECIPIENT', 'info@joztembotours.com')
-
-    upload_base = app.config.get('UPLOAD_FOLDER', 'uploads')
+    configured_upload_folder = os.environ.get('UPLOAD_FOLDER') or app.config.get('UPLOAD_FOLDER') or 'uploads'
+    app.config['UPLOAD_FOLDER'] = os.path.abspath(configured_upload_folder)
+    upload_base = app.config['UPLOAD_FOLDER']
     for folder in ['reviews', 'packages', 'excursions', 'avatars', 'blog', 'about']:
         os.makedirs(os.path.join(upload_base, folder), exist_ok=True)
+
+    cloudinary_cloud_name = os.environ.get('CLOUDINARY_CLOUD_NAME')
+    cloudinary_api_key = os.environ.get('CLOUDINARY_API_KEY')
+    cloudinary_api_secret = os.environ.get('CLOUDINARY_API_SECRET')
+    app.config['CLOUDINARY_ENABLED'] = bool(
+        cloudinary_cloud_name and cloudinary_api_key and cloudinary_api_secret
+    )
+
+    if app.config['CLOUDINARY_ENABLED']:
+        cloudinary.config(
+            cloud_name=cloudinary_cloud_name,
+            api_key=cloudinary_api_key,
+            api_secret=cloudinary_api_secret,
+            secure=True
+        )
 
     db.init_app(app)
     migrate.init_app(app, db)
 
-    # STRICT CORS FOR MOBILE & VERCEL
     CORS(
         app,
         resources={
@@ -108,7 +162,6 @@ def create_app(config_class=None):
         },
     )
 
-    # FORCE HTTPS IN PRODUCTION (Mobile Safari requires this)
     @app.before_request
     def _enforce_https():
         if app.debug:
@@ -125,18 +178,8 @@ def create_app(config_class=None):
             return jsonify({'success': False, 'error': 'HTTPS required', 'redirect': url}), 426
         return None
 
-    # SAFE MAIL (Prevents 500 Error if SMTP fails)
     mail = Mail(app)
-    _original_send = mail.send
-    def _safe_send(message):
-        try:
-            return _original_send(message)
-        except Exception as e:
-            app.logger.warning(f"[mail] Failed to send '{message.subject}': {e}")
-            return None
-    mail.send = _safe_send
 
-    # EARLY HEALTH CHECK
     @app.route("/api/health", methods=["GET"])
     def _health_early():
         return jsonify({
@@ -145,6 +188,7 @@ def create_app(config_class=None):
             "environment": os.environ.get('FLASK_ENV', 'development'),
             "cors_origins": _parse_origins(),
             "mail_configured": bool(app.config.get('MAIL_SERVER')),
+            "cloudinary_configured": bool(app.config.get('CLOUDINARY_ENABLED')),
         }), 200
 
     setup_logging(app)
@@ -163,7 +207,6 @@ def create_app(config_class=None):
                 for cat in categories:
                     db.session.add(cat)
                 db.session.commit()
-                app.logger.info("✅ Default package categories created")
             app.logger.info("✅ Database tables created/verified successfully")
         except Exception as e:
             app.logger.error(f"❌ Database initialization error: {e}")
@@ -184,7 +227,6 @@ def setup_logging(app):
     app.logger.setLevel(logging.INFO)
     app.logger.info('🦁 Joztembo Tours Backend Startup')
 
-# ============ AUTH DECORATORS ============
 def login_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
@@ -197,7 +239,6 @@ def login_required(f):
         if not user.is_active:
             return jsonify({'success': False, 'error': 'Account has been deactivated', 'code': 'inactive'}), 403
         g.current_user = user
-        g.is_impersonating = False
         return f(*args, **kwargs)
     return decorated_function
 
@@ -271,7 +312,6 @@ def optional_auth(f):
         return f(*args, **kwargs)
     return decorated_function
 
-# ============ FILE UPLOAD HELPERS ============
 def allowed_file(filename, allowed_extensions):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in allowed_extensions
 
@@ -280,17 +320,106 @@ def save_uploaded_file(file, folder, allowed_extensions):
         return None, None
     if not allowed_file(file.filename, allowed_extensions):
         return None, None
-    ext = file.filename.rsplit('.', 1)[1].lower()
+
+    original_filename = secure_filename(file.filename)
+    ext = original_filename.rsplit('.', 1)[1].lower()
     unique_filename = f"{uuid.uuid4().hex}.{ext}"
-    filename = secure_filename(unique_filename)
+    mime_type, _ = mimetypes.guess_type(original_filename)
+
+    if current_app.config.get('CLOUDINARY_ENABLED'):
+        try:
+            result = cloudinary.uploader.upload(
+                file.stream,
+                folder=f"joztembo/{folder}",
+                public_id=uuid.uuid4().hex,
+                resource_type='auto',
+                overwrite=False,
+                unique_filename=False
+            )
+            file_url = result.get('secure_url')
+            if not file_url:
+                raise RuntimeError('Cloudinary did not return a secure image URL')
+
+            return file_url, {
+                'file_name': original_filename,
+                'file_size': result.get('bytes', 0),
+                'mime_type': mime_type,
+                'public_id': result.get('public_id'),
+                'resource_type': result.get('resource_type')
+            }
+        except Exception as e:
+            current_app.logger.exception("Cloudinary upload failed")
+            raise RuntimeError(f"Cloudinary upload failed: {str(e)}") from e
+
     upload_folder = os.path.join(current_app.config['UPLOAD_FOLDER'], folder)
     os.makedirs(upload_folder, exist_ok=True)
-    filepath = os.path.join(upload_folder, filename)
+    filepath = os.path.join(upload_folder, unique_filename)
     file.save(filepath)
     file_size = os.path.getsize(filepath)
-    mime_type, _ = mimetypes.guess_type(filepath)
-    file_url = f"/uploads/{folder}/{filename}"
-    return file_url, {'file_name': file.filename, 'file_size': file_size, 'mime_type': mime_type}
+    file_url = f"/uploads/{folder}/{unique_filename}"
+
+    return file_url, {
+        'file_name': original_filename,
+        'file_size': file_size,
+        'mime_type': mime_type
+    }
+
+
+def get_upload_file_path(file_url):
+    if not file_url or not file_url.startswith('/uploads/'):
+        return None
+    relative_path = file_url[len('/uploads/'):]
+    path_parts = relative_path.split('/')
+    if len(path_parts) != 2 or any(part in ('', '.', '..') for part in path_parts):
+        return None
+    return os.path.join(current_app.config['UPLOAD_FOLDER'], *path_parts)
+
+
+def delete_uploaded_file(file_url):
+    if not file_url:
+        return False
+
+    if file_url.startswith('/uploads/'):
+        file_path = get_upload_file_path(file_url)
+        if file_path and os.path.isfile(file_path):
+            os.remove(file_path)
+            return True
+        return False
+
+    parsed_url = urlparse(file_url)
+    if parsed_url.netloc.lower() not in ('res.cloudinary.com', 'www.res.cloudinary.com'):
+        return False
+
+    if not current_app.config.get('CLOUDINARY_ENABLED'):
+        current_app.logger.warning("Cloudinary credentials are missing; remote media was not deleted")
+        return False
+
+    try:
+        path = parsed_url.path
+        if '/upload/' not in path:
+            return False
+
+        uploaded_path = path.split('/upload/', 1)[1]
+        path_parts = uploaded_path.split('/')
+        if path_parts and re.fullmatch(r'v\\d+', path_parts[0]):
+            path_parts = path_parts[1:]
+        if not path_parts:
+            return False
+
+        public_id_with_extension = '/'.join(path_parts)
+        public_id = re.sub(r'\\.[^.]+$', '', public_id_with_extension)
+        resource_type = 'video' if '/video/upload/' in path else 'image'
+
+        result = cloudinary.uploader.destroy(
+            public_id,
+            resource_type=resource_type,
+            invalidate=True
+        )
+        return result.get('result') == 'ok'
+    except Exception:
+        current_app.logger.exception("Cloudinary media deletion failed")
+        return False
+
 
 def get_media_type(filename):
     ext = filename.rsplit('.', 1)[1].lower() if '.' in filename else ''
@@ -300,14 +429,32 @@ def get_media_type(filename):
     elif ext in video_exts: return 'video'
     return None
 
-# ============================================================
-# ROUTES
-# ============================================================
 def register_routes(app, mail):
+    
+    @app.route("/api/test-email", methods=["GET"])
+    def test_email():
+        try:
+            html_content = generate_email_template(
+                "Test Email Successful!",
+                "<p>Congratulations! Your HTML emails with the logo are working perfectly.</p>"
+            )
+            msg = Message(subject="TEST EMAIL FROM JOZTEMBO TOURS", recipients=["tembo4401@gmail.com"])
+            msg.html = html_content
+            mail.send(msg)
+            return "<h1>SUCCESS! The styled email was sent. Check your inbox.</h1>", 200
+        except Exception as e:
+            return f"<h1>FAILED TO SEND EMAIL</h1><p>Error: {str(e)}</p>", 500
+
     @app.route('/uploads/<path:folder>/<path:filename>')
     def serve_upload(folder, filename):
+        allowed_folders = {'reviews', 'packages', 'excursions', 'avatars', 'blog', 'about'}
+        if folder not in allowed_folders:
+            return jsonify({'success': False, 'error': 'File not found'}), 404
         upload_folder = os.path.join(app.config['UPLOAD_FOLDER'], folder)
-        return send_from_directory(upload_folder, filename)
+        response = send_from_directory(upload_folder, filename, conditional=True, max_age=86400)
+        response.headers['Cache-Control'] = 'public, max-age=86400'
+        response.headers['X-Content-Type-Options'] = 'nosniff'
+        return response
 
     @app.route("/api/auth/register", methods=["POST"])
     def register():
@@ -724,10 +871,7 @@ def register_routes(app, mail):
             media = ReviewMedia.query.get(media_id)
             if not media:
                 return jsonify({'success': False, 'error': 'Media not found'}), 404
-            try:
-                file_path = os.path.join(app.root_path, media.file_url.lstrip('/'))
-                if os.path.exists(file_path): os.remove(file_path)
-            except: pass
+            delete_uploaded_file(media.file_url)
             db.session.delete(media)
             db.session.commit()
             return jsonify({'success': True, 'message': 'Media deleted'}), 200
@@ -956,10 +1100,7 @@ def register_routes(app, mail):
             if not media:
                 return jsonify({'success': False, 'error': 'Media not found'}), 404
             if media.source == 'upload':
-                try:
-                    file_path = os.path.join(app.root_path, media.file_url.lstrip('/'))
-                    if os.path.exists(file_path): os.remove(file_path)
-                except: pass
+                delete_uploaded_file(media.file_url)
             db.session.delete(media)
             db.session.commit()
             return jsonify({'success': True, 'message': 'Media deleted'}), 200
@@ -1169,10 +1310,7 @@ def register_routes(app, mail):
             if not media:
                 return jsonify({'success': False, 'error': 'Media not found'}), 404
             if media.source == 'upload':
-                try:
-                    file_path = os.path.join(app.root_path, media.file_url.lstrip('/'))
-                    if os.path.exists(file_path): os.remove(file_path)
-                except: pass
+                delete_uploaded_file(media.file_url)
             db.session.delete(media)
             db.session.commit()
             return jsonify({'success': True, 'message': 'Media deleted'}), 200
@@ -1628,11 +1766,7 @@ def register_routes(app, mail):
             person = AboutPerson.query.get(person_id)
             if not person:
                 return jsonify({'success': False, 'error': 'Person not found'}), 404
-            if person.image_url and person.image_url.startswith('/uploads/'):
-                try:
-                    file_path = os.path.join(app.root_path, person.image_url.lstrip('/'))
-                    if os.path.exists(file_path): os.remove(file_path)
-                except Exception: pass
+            delete_uploaded_file(person.image_url)
             db.session.delete(person)
             db.session.commit()
             return jsonify({'success': True, 'message': 'Person deleted'}), 200
@@ -1658,37 +1792,179 @@ def register_routes(app, mail):
             phone = (data.get('phone') or '').strip()
             subject = (data.get('subject') or 'General Inquiry').strip()
             message = data['message'].strip()
-            if g.current_user:
-                if not phone: phone = g.current_user.phone or '—'
-                user_tag = f"Registered user (ID: {g.current_user.id})"
-            else: user_tag = "Guest (not signed in)"
+            
             admin_recipient = app.config.get('MAIL_ADMIN_RECIPIENT', 'info@joztembotours.com')
             sender = app.config.get('MAIL_DEFAULT_SENDER') or app.config.get('MAIL_USERNAME')
-            submitted_at = datetime.now(UTC).strftime('%A, %d %B %Y at %H:%M UTC')
             ticket_id = f"JT-{uuid.uuid4().hex[:8].upper()}"
-            BRAND_ORANGE = "#ea580c"
-            BRAND_DARK = "#0f172a"
-            BRAND_MUTED = "#64748b"
-            admin_html = f"""...""" # HTML omitted for brevity
-            first_name = name.split()[0] if name else "there"
-            customer_html = f"""...""" # HTML omitted for brevity
+            
+            # 1. ADMIN EMAIL
+            admin_html = f"""
+            <h3>New Contact Form Submission</h3>
+            <p><strong>Name:</strong> {name}</p>
+            <p><strong>Email:</strong> {email}</p>
+            <p><strong>Phone:</strong> {phone or '—'}</p>
+            <p><strong>Subject:</strong> {subject}</p>
+            <div class="highlight-box">
+                <p><strong>Message:</strong></p>
+                <p>{message}</p>
+            </div>
+            """
+            admin_msg = Message(subject=f"[{ticket_id}] {subject} — from {name}", recipients=[admin_recipient])
+            if sender: admin_msg.sender = sender
+            if email: admin_msg.reply_to = email
+            admin_msg.html = generate_email_template(f"Contact Form: {ticket_id}", admin_html)
 
-            try:
-                admin_msg = Message(subject=f"[{ticket_id}] {subject} — from {name}", recipients=[admin_recipient], html=admin_html)
-                if sender: admin_msg.sender = sender
-                if email: admin_msg.reply_to = email
-                mail.send(admin_msg)
-            except Exception as mail_err: app.logger.warning(f"Admin contact mail failed: {mail_err}")
-            try:
-                customer_msg = Message(subject=f"We received your message — {ticket_id}", recipients=[email], html=customer_html)
-                if sender: customer_msg.sender = sender
-                mail.send(customer_msg)
-            except Exception as mail_err: app.logger.warning(f"Customer contact auto-reply failed: {mail_err}")
+            # 2. CUSTOMER EMAIL
+            customer_html = f"""
+            <h3>Hi {name},</h3>
+            <p>We have received your message and our team will get back to you within 24 hours.</p>
+            <p>Here is your reference number for your records:</p>
+            <div class="highlight-box" style="text-align: center; font-size: 18px;">
+                <strong>{ticket_id}</strong>
+            </div>
+            <p>Your message:</p>
+            <p style="color: #666; font-style: italic;">"{message}"</p>
+            """
+            customer_msg = Message(subject=f"We received your message — {ticket_id}", recipients=[email])
+            if sender: customer_msg.sender = sender
+            customer_msg.html = generate_email_template("Message Received", customer_html)
+
+            # SEND BOTH AT THE SAME TIME
+            with mail.connect() as conn:
+                conn.send(admin_msg)
+                conn.send(customer_msg)
+
             app.logger.info(f"Contact form submitted: {ticket_id} from {email} ({subject})")
             return jsonify({'success': True, 'message': 'Message sent successfully', 'ticket_id': ticket_id}), 201
         except Exception as e:
             app.logger.error(f"Contact form error: {e}")
-            return jsonify({'success': False, 'error': 'Failed to send message'}), 500
+            return jsonify({'success': False, 'error': f'Failed to send message: {str(e)}'}), 500
+
+       
+
+    @app.route("/api/transfer-quick-inquiry", methods=["POST"])
+    def create_quick_transfer_inquiry():
+        try:
+            data = request.get_json(silent=True) or {}
+
+            required_fields = (
+                "name", "email", "phone", "pickup_location",
+                "dropoff_location", "date_time", "transfer_type"
+            )
+            missing = [field for field in required_fields if not str(data.get(field, "")).strip()]
+            if missing:
+                return jsonify({
+                    "success": False,
+                    "error": f"Please complete all required fields: {', '.join(missing)}"
+                }), 400
+
+            email = str(data["email"]).strip().lower()
+            email_pattern = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+            if not email_pattern.match(email):
+                return jsonify({"success": False, "error": "Please enter a valid email address."}), 400
+
+            try:
+                pax = int(data.get("passengers", 1))
+            except (TypeError, ValueError):
+                return jsonify({"success": False, "error": "Passenger count must be a number."}), 400
+
+            if pax < 1 or pax > 20:
+                return jsonify({"success": False, "error": "Passenger count must be between 1 and 20."}), 400
+
+            transfer_type = str(data["transfer_type"]).strip()
+            if transfer_type not in ("airport-to-hotel", "hotel-to-airport"):
+                return jsonify({"success": False, "error": "Please select a valid transfer type."}), 400
+
+            reference_code = f"JT-TRF-{uuid.uuid4().hex[:6].upper()}"
+            name = escape(str(data["name"]).strip())
+            phone = escape(str(data["phone"]).strip())
+            pickup = escape(str(data["pickup_location"]).strip())
+            dropoff = escape(str(data["dropoff_location"]).strip())
+            date_time = escape(str(data["date_time"]).strip())
+            transfer_label = "Airport to Hotel" if transfer_type == "airport-to-hotel" else "Hotel to Airport"
+            admin_recipient = app.config.get("MAIL_ADMIN_RECIPIENT", "info@joztembotours.com")
+            sender = app.config.get("MAIL_DEFAULT_SENDER") or app.config.get("MAIL_USERNAME")
+
+            details_html = f"""
+                <table role="presentation" width="100%" cellpadding="0" cellspacing="0"
+                       style="border-collapse:collapse;font-size:14px;">
+                    <tr><td style="padding:10px 0;color:#777;border-bottom:1px solid #eee;">Reference</td>
+                        <td style="padding:10px 0;text-align:right;font-weight:bold;border-bottom:1px solid #eee;">{reference_code}</td></tr>
+                    <tr><td style="padding:10px 0;color:#777;border-bottom:1px solid #eee;">Transfer type</td>
+                        <td style="padding:10px 0;text-align:right;border-bottom:1px solid #eee;">{transfer_label}</td></tr>
+                    <tr><td style="padding:10px 0;color:#777;border-bottom:1px solid #eee;">Pickup location</td>
+                        <td style="padding:10px 0;text-align:right;border-bottom:1px solid #eee;">{pickup}</td></tr>
+                    <tr><td style="padding:10px 0;color:#777;border-bottom:1px solid #eee;">Drop-off location</td>
+                        <td style="padding:10px 0;text-align:right;border-bottom:1px solid #eee;">{dropoff}</td></tr>
+                    <tr><td style="padding:10px 0;color:#777;border-bottom:1px solid #eee;">Date &amp; time</td>
+                        <td style="padding:10px 0;text-align:right;border-bottom:1px solid #eee;">{date_time}</td></tr>
+                    <tr><td style="padding:10px 0;color:#777;border-bottom:1px solid #eee;">Passengers</td>
+                        <td style="padding:10px 0;text-align:right;border-bottom:1px solid #eee;">{pax}</td></tr>
+                    <tr><td style="padding:10px 0;color:#777;border-bottom:1px solid #eee;">Customer name</td>
+                        <td style="padding:10px 0;text-align:right;border-bottom:1px solid #eee;">{name}</td></tr>
+                    <tr><td style="padding:10px 0;color:#777;">Phone</td>
+                        <td style="padding:10px 0;text-align:right;">{phone}</td></tr>
+                </table>
+            """
+
+            admin_html = f"""
+                <p style="margin-top:0;">A new transfer request has been submitted through the website.</p>
+                <div class="highlight-box">
+                    <strong>New transfer inquiry · {reference_code}</strong>
+                </div>
+                {details_html}
+                <p style="margin-top:22px;">Reply directly to this email to contact the customer at {escape(email)}.</p>
+            """
+            admin_message = Message(
+                subject=f"[{reference_code}] New transfer request — {name}",
+                recipients=[admin_recipient]
+            )
+            if sender:
+                admin_message.sender = sender
+            admin_message.reply_to = email
+            admin_message.html = generate_email_template("New Transfer Request", admin_html)
+
+            customer_html = f"""
+                <p>Hello {name},</p>
+                <p>Thank you for choosing <strong>Joz Tembo Tours &amp; Safari</strong>.
+                   We have successfully received your transfer request.</p>
+                <div class="highlight-box" style="text-align:center;">
+                    <p style="margin:0 0 6px;color:#777;font-size:12px;text-transform:uppercase;letter-spacing:1px;">
+                        Your reference number
+                    </p>
+                    <strong style="font-size:22px;letter-spacing:1px;">{reference_code}</strong>
+                </div>
+                <h3 style="margin-bottom:10px;">Your request summary</h3>
+                {details_html}
+                <p style="margin-top:22px;">Our team will review your request and contact you to confirm availability and pricing.</p>
+                <p>We look forward to making your journey comfortable and seamless.</p>
+                <p style="margin-bottom:0;"><strong>Joz Tembo Tours &amp; Safari</strong></p>
+            """
+            customer_message = Message(
+                subject=f"Transfer request received — {reference_code}",
+                recipients=[email]
+            )
+            if sender:
+                customer_message.sender = sender
+            customer_message.html = generate_email_template("We’ve Received Your Request", customer_html)
+
+            with mail.connect() as connection:
+                connection.send(admin_message)
+                connection.send(customer_message)
+
+            app.logger.info("Quick transfer inquiry %s received from %s", reference_code, email)
+            return jsonify({
+                "success": True,
+                "message": "Your transfer request has been received successfully.",
+                "reference_code": reference_code
+            }), 201
+
+        except Exception as e:
+            app.logger.exception("Quick transfer inquiry email failed")
+            return jsonify({
+                "success": False,
+                "error": "We could not send your request right now. Please try again or contact us directly."
+            }), 500
 
     @app.route("/api/inquiries", methods=["POST"])
     @optional_auth
@@ -1699,6 +1975,11 @@ def register_routes(app, mail):
                 if not data.get(field): return jsonify({'success': False, 'error': f'{field} is required'}), 400
             email_pattern = re.compile(r'^[^\s@]+@[^\s@]+\.[^\s@]+$')
             if not email_pattern.match(str(data['email'])): return jsonify({'success': False, 'error': 'Invalid email format'}), 400
+            
+            # Generate Reference Number
+            ref_prefix = {'package': 'PKG', 'excursion': 'EXC', 'transfer': 'TRF'}.get(data['type'], 'INQ')
+            reference_code = f"JT-{ref_prefix}-{uuid.uuid4().hex[:6].upper()}"
+
             unit_price = 0.0
             currency = 'USD'
             resolved_name = data.get('item_name') or 'N/A'
@@ -1742,34 +2023,71 @@ def register_routes(app, mail):
                 unit_price = float(chosen_rate or 0)
                 pricing_label = f"Transfer tier for {pax_n} pax"
             else: return jsonify({'success': False, 'error': 'Invalid inquiry type'}), 400
+            
             pax = max(1, int(data.get('pax') or 1))
             price_estimate = unit_price * pax
             admin_recipient = app.config.get('MAIL_ADMIN_RECIPIENT', 'info@joztembotours.com')
             sender = app.config.get('MAIL_DEFAULT_SENDER') or app.config.get('MAIL_USERNAME')
-            pricing_row = ""
-            if pricing_label: pricing_row = f'<tr><td style="background:#fef3c7"><b>Pricing tier</b></td><td>{pricing_label}</td></tr>'
-            admin_html = f"""...""" # HTML omitted for brevity
-            try:
-                msg = Message(subject=f"New {data['type'].title()} Inquiry — {resolved_name}", recipients=[admin_recipient], html=admin_html)
-                if sender: msg.sender = sender
-                if data.get('email'): msg.reply_to = data['email']
-                mail.send(msg)
-            except Exception as mail_err: app.logger.warning(f"Admin inquiry mail failed: {mail_err}")
-            confirm_html = f"""...""" # HTML omitted for brevity
-            try:
-                confirm = Message(subject=f"We received your inquiry — {resolved_name}", recipients=[data['email']], html=confirm_html)
-                if sender: confirm.sender = sender
-                mail.send(confirm)
-            except Exception as mail_err: app.logger.warning(f"Customer confirmation mail failed: {mail_err}")
-            return jsonify({'success': True, 'message': 'Inquiry received. We will contact you shortly.', 'price_estimate': price_estimate, 'currency': currency, 'pax': pax, 'pricing_label': pricing_label}), 201
+
+            # 1. ADMIN EMAIL
+            admin_html = f"""
+            <h3>New {data['type'].title()} Inquiry</h3>
+            <p><strong>Reference:</strong> {reference_code}</p>
+            <p><strong>Item:</strong> {resolved_name}</p>
+            <p><strong>Name:</strong> {data['name']}</p>
+            <p><strong>Email:</strong> {data['email']}</p>
+            <p><strong>Phone:</strong> {data.get('phone', '—')}</p>
+            <p><strong>Pax:</strong> {pax}</p>
+            <p><strong>Pricing:</strong> {pricing_label or 'n/a'}</p>
+            <div class="highlight-box">
+                <p><strong>Estimated Price:</strong> {price_estimate:,.2f} {currency}</p>
+            </div>
+            <p><strong>Message:</strong></p>
+            <p style="color: #666; font-style: italic;">"{data.get('message', 'No message provided.')}"</p>
+            """
+            msg = Message(subject=f"[{reference_code}] New {data['type'].title()} Inquiry — {resolved_name}", recipients=[admin_recipient])
+            if sender: msg.sender = sender
+            if data.get('email'): msg.reply_to = data['email']
+            msg.html = generate_email_template(f"Inquiry: {reference_code}", admin_html)
+
+            # 2. CUSTOMER EMAIL
+            customer_html = f"""
+            <h3>Hi {data['name']},</h3>
+            <p>Our team is currently working on your inquiry for <strong>{resolved_name}</strong>. We will get back to you shortly with more details.</p>
+            <div class="highlight-box">
+                <p><strong>Reference Number:</strong> {reference_code}</p>
+                <p><strong>Route/Item:</strong> {resolved_name}</p>
+                <p><strong>Estimated Price:</strong> {price_estimate:,.2f} {currency}</p>
+                <p><strong>Pricing Details:</strong> {pricing_label or 'Custom Group Rate'}</p>
+            </div>
+            <p>Thank you for considering Joz Tembo Tours for your safari adventure.</p>
+            """
+            confirm = Message(subject=f"We received your inquiry — {reference_code}", recipients=[data['email']])
+            if sender: confirm.sender = sender
+            confirm.html = generate_email_template("Inquiry Received", customer_html)
+
+            # SEND BOTH AT THE SAME TIME
+            with mail.connect() as conn:
+                conn.send(msg)
+                conn.send(confirm)
+
+            return jsonify({
+                'success': True, 
+                'message': 'Inquiry received. We will contact you shortly.', 
+                'reference_code': reference_code,
+                'price_estimate': price_estimate, 
+                'currency': currency, 
+                'pax': pax, 
+                'pricing_label': pricing_label
+            }), 201
         except Exception as e:
             app.logger.error(f"Inquiry error: {e}")
-            return jsonify({'success': False, 'error': str(e)}), 500
+            return jsonify({'success': False, 'error': f'Inquiry failed: {str(e)}'}), 500
 
     @app.route("/")
     def index():
         return jsonify({"message": "🦁 Joztembo Tours - Backend API", "version": "3.7"}), 200
-
+load_dotenv()
 
 app = create_app()
 

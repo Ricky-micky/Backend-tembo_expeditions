@@ -14,6 +14,7 @@ werkzeug = "*"
 python-dotenv = "*"
 pillow = "*"
 gunicorn = "*"
+cloudinary = "*"
 
 [dev-packages]
 
