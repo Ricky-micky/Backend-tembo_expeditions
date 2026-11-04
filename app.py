@@ -57,6 +57,7 @@ def _parse_origins():
         'http://localhost:5173', 'http://127.0.0.1:5173',
         'http://localhost:3000', 'http://127.0.0.1:3000',
         'https://temboexpedition.vercel.app',
+        'https://backend-tembo-expeditions.onrender.com',
     ]
     for d in defaults:
         if d not in origins:
@@ -172,6 +173,9 @@ def create_app(config_class=None):
     db.init_app(app)
     migrate.init_app(app, db)
 
+    # --- UPDATED CORS CONFIGURATION ---
+    # This uses the _cors_regex() function defined at the top, which allows 
+    # localhost, your Vercel frontend, and your Render backend.
     CORS(
         app,
         resources={
@@ -184,7 +188,7 @@ def create_app(config_class=None):
                 "max_age": 3600,
             },
             r"/uploads/*": {
-                "origins": _cors_regex(),
+                "origins": "*", # Uploads can be public
                 "methods": ["GET", "OPTIONS"],
                 "allow_headers": ["Content-Type"],
             },
