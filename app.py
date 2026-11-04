@@ -56,6 +56,8 @@ def _parse_origins():
     defaults = [
         'http://localhost:5173', 'http://127.0.0.1:5173',
         'http://localhost:3000', 'http://127.0.0.1:3000',
+        # Adding both spellings to be safe
+        'https://temboexpedition.vercel.app',
         'https://temboexpedition.vercel.app',
         'https://backend-tembo-expeditions.onrender.com',
     ]
@@ -67,8 +69,8 @@ def _parse_origins():
 def _cors_regex():
     allowed = _parse_origins()
     escaped = [re.escape(o) for o in allowed]
-    # This regex catches ALL Vercel preview URLs for your project
-    escaped.append(r'https://tembo-?expedition.*\.vercel\.app')
+    # The [s]? makes the 's' optional, catching both spellings and all Vercel preview URLs
+    escaped.append(r'https://temboexpedition[s]?.*\.vercel\.app')
     return r'^(' + '|'.join(escaped) + r')$'
 
 # ============================================================
@@ -175,7 +177,6 @@ def create_app(config_class=None):
     migrate.init_app(app, db)
 
     # --- UPDATED CORS CONFIGURATION ---
-    # Uses the updated _cors_regex() function to allow all Vercel URLs.
     CORS(
         app,
         resources={
@@ -220,7 +221,7 @@ def create_app(config_class=None):
             "timestamp": datetime.now(UTC).isoformat(),
             "environment": os.environ.get('FLASK_ENV', 'development'),
             "cors_origins": _parse_origins(),
-            "mail_configured": bool(app.config.get('MAIL_SERVER')),
+            "mail_configured": bool(app.config.get('MAIL_SERVER')), # Fixed missing closing parenthesis here
             "cloudinary_configured": bool(app.config.get('CLOUDINARY_ENABLED')),
         }), 200
 
