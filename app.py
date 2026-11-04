@@ -67,7 +67,8 @@ def _parse_origins():
 def _cors_regex():
     allowed = _parse_origins()
     escaped = [re.escape(o) for o in allowed]
-    escaped.append(r'https://temboexpedition-[a-zA-Z0-9\-]+\.vercel\.app')
+    # This regex catches ALL Vercel preview URLs for your project
+    escaped.append(r'https://tembo-?expedition.*\.vercel\.app')
     return r'^(' + '|'.join(escaped) + r')$'
 
 # ============================================================
@@ -174,8 +175,7 @@ def create_app(config_class=None):
     migrate.init_app(app, db)
 
     # --- UPDATED CORS CONFIGURATION ---
-    # This uses the _cors_regex() function defined at the top, which allows 
-    # localhost, your Vercel frontend, and your Render backend.
+    # Uses the updated _cors_regex() function to allow all Vercel URLs.
     CORS(
         app,
         resources={
