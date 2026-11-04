@@ -1,4 +1,4 @@
-# models.py - Complete models with Admin Hierarchy, Reviews, Packages, Excursions, Transfers, Blog, About
+# models.py - Complete models with Admin Hierarchy, Reviews, Packages, Excursions, Transfers, Blog, About, Parks
 from datetime import datetime
 from extensions import db
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -60,6 +60,8 @@ class User(db.Model):
                                          foreign_keys='Transfer.created_by_id')
     created_blog_posts = db.relationship('BlogPost', backref='author', lazy=True,
                                           foreign_keys='BlogPost.author_id')
+    created_parks = db.relationship('Park', backref='creator', lazy=True,
+                                     foreign_keys='Park.created_by_id')
 
     admin_actions = db.relationship('AdminActionLog', backref='admin', lazy=True,
                                      foreign_keys='AdminActionLog.admin_id')
@@ -123,6 +125,9 @@ class User(db.Model):
     def can_manage_about(self):
         return self.is_super_admin() or self.is_coordinator() or self.is_content_manager()
 
+    def can_manage_parks(self):
+        return self.is_super_admin() or self.is_coordinator() or self.is_content_manager()
+
     def can_moderate_reviews(self):
         return self.is_admin
 
@@ -147,6 +152,7 @@ class User(db.Model):
             'can_manage_excursions': self.can_manage_excursions(),
             'can_manage_blog': self.can_manage_blog(),
             'can_manage_about': self.can_manage_about(),
+            'can_manage_parks': self.can_manage_parks(),
             'can_moderate_reviews': self.can_moderate_reviews(),
             'can_delete_review': self.can_delete_review(),
             'can_edit_any_review': self.can_edit_any_review(),
@@ -427,6 +433,7 @@ class Package(db.Model):
     full_itinerary = db.Column(db.Text, default='')
 
     category_id = db.Column(db.Integer, db.ForeignKey('package_categories.id'), nullable=True)
+    park_id = db.Column(db.Integer, db.ForeignKey('parks.id'), nullable=True, index=True)
 
     prices = db.Column(db.JSON, default=dict)
     price_notes = db.Column(db.Text, default='')
@@ -441,6 +448,9 @@ class Package(db.Model):
     created_by_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    park = db.relationship('Park', backref=db.backref('packages', lazy='dynamic'),
+                           foreign_keys=[park_id])
 
     media = db.relationship('PackageMedia', backref='package', lazy='dynamic',
                             cascade='all, delete-orphan')
@@ -466,6 +476,8 @@ class Package(db.Model):
             'total_nights': self.total_nights,
             'full_itinerary': self.full_itinerary,
             'category': self.category.to_dict() if self.category else None,
+            'park': {'id': self.park.id, 'name': self.park.name, 'slug': self.park.slug} if self.park else None,
+            'park_id': self.park_id,
             'prices': self.prices or {},
             'price_notes': self.price_notes,
             'includes': self.includes or [],
@@ -820,6 +832,93 @@ class AboutPerson(db.Model):
         }
 
 
+# ============ PARKS SYSTEM ============
+
+class Park(db.Model):
+    """
+    National parks / reserves. Packages link to parks via park_id FK
+    (with optional name-prefix fallback for legacy data).
+    """
+    __tablename__ = 'parks'
+
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(150), unique=True, nullable=False)
+    slug = db.Column(db.String(150), unique=True, nullable=False, index=True)
+    location = db.Column(db.String(200))
+    tagline = db.Column(db.String(255))
+    description = db.Column(db.Text)
+    history = db.Column(db.Text)
+
+    # Lists stored as JSON: ["Elephant", "Lion", ...]
+    wildlife = db.Column(db.JSON, default=list)
+    # [{"name": "The Big Tusker", "story": "..."}, ...]
+    animal_stories = db.Column(db.JSON, default=list)
+
+    best_time_to_visit = db.Column(db.String(255))
+    area_km2 = db.Column(db.Float, nullable=True)
+    established_year = db.Column(db.Integer, nullable=True)
+
+    hero_image = db.Column(db.String(500), default='')
+    gallery = db.Column(db.JSON, default=list)  # list of image URLs
+
+    display_order = db.Column(db.Integer, default=0)
+    is_active = db.Column(db.Boolean, default=True, index=True)
+
+    created_by_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def get_packages(self, include_inactive=False):
+        """
+        Return packages for this park.
+        Primary: linked by park_id.
+        Fallback: package name starts with this park's name (legacy support).
+        """
+        q = Package.query.filter(Package.park_id == self.id)
+        if not include_inactive:
+            q = q.filter(Package.is_active == True)
+        pkgs = q.order_by(Package.display_order).all()
+        if pkgs:
+            return pkgs
+
+        # Legacy fallback
+        q2 = Package.query.filter(Package.name.ilike(f"{self.name}%"))
+        if not include_inactive:
+            q2 = q2.filter(Package.is_active == True)
+        return q2.order_by(Package.display_order).all()
+
+    def to_dict(self, include_packages=False):
+        data = {
+            'id': self.id,
+            'name': self.name,
+            'slug': self.slug,
+            'location': self.location,
+            'tagline': self.tagline,
+            'description': self.description,
+            'history': self.history,
+            'wildlife': self.wildlife or [],
+            'animal_stories': self.animal_stories or [],
+            'best_time_to_visit': self.best_time_to_visit,
+            'area_km2': self.area_km2,
+            'established_year': self.established_year,
+            'hero_image': self.hero_image,
+            'gallery': self.gallery or [],
+            'display_order': self.display_order,
+            'is_active': self.is_active,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+        if include_packages:
+            data['packages'] = [
+                p.to_dict(include_days=False, include_media=False)
+                for p in self.get_packages()
+            ]
+        return data
+
+    def __repr__(self):
+        return f'<Park {self.name}>'
+
+
 # ============ LEGACY MODELS ============
 
 class Comment(db.Model):
@@ -856,24 +955,3 @@ class Story(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     is_active = db.Column(db.Boolean, default=True)
-
-
-class Park(db.Model):
-    __tablename__ = 'parks'
-
-    id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String(100), unique=True, nullable=False)
-    location = db.Column(db.String(200))
-    description = db.Column(db.Text)
-    known_for = db.Column(db.JSON)
-    is_active = db.Column(db.Boolean, default=True)
-
-    def to_dict(self):
-        return {
-            'id': self.id,
-            'name': self.name,
-            'location': self.location,
-            'description': self.description,
-            'known_for': self.known_for or [],
-            'is_active': self.is_active
-        }

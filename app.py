@@ -1,4 +1,4 @@
-# app.py - Complete Backend with Admin Hierarchy, Reviews, Packages, Excursions, Transfers, Blog, About, Community Stories
+# app.py - Complete Backend with Admin Hierarchy, Reviews, Packages, Excursions, Transfers, Blog, About, Community Stories, Parks
 from flask import Flask, request, jsonify, g, send_from_directory, current_app
 from flask_mail import Mail, Message
 from flask_cors import CORS
@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 import os
 import logging
 import re
+import json
 import jwt
 import uuid
 import mimetypes
@@ -35,10 +36,19 @@ from models import (
 UTC = timezone.utc
 MAX_EXCURSION_MEDIA = 4
 
-# ⚠️ REPLACE THIS with a real URL where your logo is hosted.
-# For now, I am using a placeholder safari image so it renders correctly.
-# Example: "https://yourwebsite.com/uploads/branding/logo.png"
-LOGO_URL = "https://temboexpedition.vercel.app/joz-logo.png" 
+# Logo is embedded INSIDE each email (CID inline attachment) so it always shows,
+# even when the email client blocks remote images or the website is unreachable.
+# Put the file at: <backend folder>/static/joz-logo-email.png
+LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "joz-logo-email.png")
+LOGO_CID = "joz-logo"
+
+try:
+    from importlib.metadata import version as _pkg_version
+    _FLASK_MAIL_DICT_HEADERS = tuple(int(x) for x in _pkg_version("Flask-Mail").split(".")[:2]) >= (0, 10)
+except Exception:
+    _FLASK_MAIL_DICT_HEADERS = True
+# Fallback only used if the local file is missing
+LOGO_URL = "https://temboexpedition.vercel.app/joz-logo.png"
 
 def _parse_origins():
     raw = os.environ.get('ALLOWED_ORIGINS', '')
@@ -62,7 +72,8 @@ def _cors_regex():
 # ============================================================
 # HTML EMAIL TEMPLATE HELPER
 # ============================================================
-def generate_email_template(title, content_html, footer_message="Joz Tembo Tours & Safari"):
+def generate_email_template(title, content_html, footer_message="Joz Tembo Tours & Safari", logo_src=None):
+    logo_src = logo_src or LOGO_URL
     return f"""
     <!DOCTYPE html>
     <html>
@@ -71,9 +82,9 @@ def generate_email_template(title, content_html, footer_message="Joz Tembo Tours
         <style>
             body {{ font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; background-color: #f4f4f4; margin: 0; padding: 20px; color: #333; }}
             .container {{ max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
-            .header {{ background-color: #1a1a1a; padding: 25px 20px; text-align: center; }}
-            .header img {{ max-height: 90px; width: auto; }}
-            .header h1 {{ color: #ffffff; margin: 15px 0 0 0; font-size: 22px; font-weight: 500; letter-spacing: 1px; }}
+            .header {{ background-color: #fdf9eb; padding: 25px 20px; text-align: center; border-bottom: 3px solid #d4af37; }}
+            .header img {{ max-height: 140px; width: auto; max-width: 100%; }}
+            .header h1 {{ color: #5a2d0c; margin: 15px 0 0 0; font-size: 22px; font-weight: 500; letter-spacing: 1px; }}
             .content {{ padding: 30px; line-height: 1.6; font-size: 15px; }}
             .highlight-box {{ background-color: #f8f9fa; border-left: 4px solid #d4af37; padding: 15px; margin: 20px 0; border-radius: 4px; }}
             .highlight-box strong {{ color: #1a1a1a; }}
@@ -85,14 +96,14 @@ def generate_email_template(title, content_html, footer_message="Joz Tembo Tours
     <body>
         <div class="container">
             <div class="header">
-                <img src="{LOGO_URL}" alt="Joz Tembo Tours Logo">
+                <img src="{logo_src}" alt="Joz Tembo Tours Logo" width="260" style="display:block;margin:0 auto;height:auto;border:0;">
                 <h1>{title}</h1>
             </div>
             <div class="content">
                 {content_html}
             </div>
             <div class="footer">
-                <img src="{LOGO_URL}" alt="Joz Tembo Tours">
+                <img src="{logo_src}" alt="Joz Tembo Tours" width="110" style="display:block;margin:0 auto 10px;height:auto;border:0;">
                 <p>{footer_message}<br>
                 Thank you for choosing us!<br>
                 &copy; {datetime.now().year} Joz Tembo Tours. All rights reserved.</p>
@@ -101,6 +112,23 @@ def generate_email_template(title, content_html, footer_message="Joz Tembo Tours
     </body>
     </html>
     """
+
+def set_email_html(msg, title, content_html, footer_message="Joz Tembo Tours & Safari"):
+    """Build the branded HTML and embed the logo into the message."""
+    logo_src = None
+    try:
+        with open(LOGO_PATH, "rb") as f:
+            logo_bytes = f.read()
+        # Flask-Mail >= 0.10 wants headers as a dict; older versions want a list of tuples
+        logo_headers = {"Content-ID": f"<{LOGO_CID}>", "X-Attachment-Id": LOGO_CID}
+        if not _FLASK_MAIL_DICT_HEADERS:
+            logo_headers = list(logo_headers.items())
+        msg.attach("joz-logo.png", "image/png", logo_bytes, "inline", headers=logo_headers)
+        logo_src = f"cid:{LOGO_CID}"
+    except OSError:
+        logging.getLogger(__name__).warning("Email logo not found at %s - using URL fallback", LOGO_PATH)
+    msg.html = generate_email_template(title, content_html, footer_message, logo_src=logo_src)
+    return msg
 
 def create_app(config_class=None):
     app = Flask(__name__)
@@ -122,7 +150,8 @@ def create_app(config_class=None):
     configured_upload_folder = os.environ.get('UPLOAD_FOLDER') or app.config.get('UPLOAD_FOLDER') or 'uploads'
     app.config['UPLOAD_FOLDER'] = os.path.abspath(configured_upload_folder)
     upload_base = app.config['UPLOAD_FOLDER']
-    for folder in ['reviews', 'packages', 'excursions', 'avatars', 'blog', 'about']:
+    # NOTE: 'parks' added for forward-compat. Existing folders unchanged.
+    for folder in ['reviews', 'packages', 'excursions', 'avatars', 'blog', 'about', 'parks']:
         os.makedirs(os.path.join(upload_base, folder), exist_ok=True)
 
     cloudinary_cloud_name = os.environ.get('CLOUDINARY_CLOUD_NAME')
@@ -429,17 +458,124 @@ def get_media_type(filename):
     elif ext in video_exts: return 'video'
     return None
 
+
+# ------------------------------------------------------------------
+# PARK HELPERS
+# ------------------------------------------------------------------
+def _slugify(text):
+    slug = re.sub(r'[^a-z0-9]+', '-', (text or '').lower()).strip('-')
+    return slug or f"park-{uuid.uuid4().hex[:8]}"
+
+
+def _unique_park_slug(base_slug, ignore_id=None):
+    slug = base_slug
+    i = 1
+    q = Park.query.filter_by(slug=slug)
+    if ignore_id is not None:
+        q = q.filter(Park.id != ignore_id)
+    while q.first():
+        slug = f"{base_slug}-{i}"
+        i += 1
+        q = Park.query.filter_by(slug=slug)
+        if ignore_id is not None:
+            q = q.filter(Park.id != ignore_id)
+    return slug
+
+
+def _coerce_park_list(value):
+    """Accept JSON list, JSON string, or newline/comma string → list."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, list):
+                return parsed
+        except Exception:
+            pass
+        # Fallback: split on newlines
+        return [line.strip() for line in value.split('\n') if line.strip()]
+    return []
+
+
+def _coerce_animal_stories(value):
+    """Accept list of {name, story}, JSON string, or 'Name :: Story' lines."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        out = []
+        for item in value:
+            if isinstance(item, dict) and item.get('name') and item.get('story'):
+                out.append({'name': str(item['name']), 'story': str(item['story'])})
+        return out
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, list):
+                return _coerce_animal_stories(parsed)
+        except Exception:
+            pass
+        out = []
+        for line in value.split('\n'):
+            if '::' in line:
+                name, story = line.split('::', 1)
+                if name.strip() and story.strip():
+                    out.append({'name': name.strip(), 'story': story.strip()})
+        return out
+    return []
+
+
+def _parse_park_payload():
+    """Parse JSON or multipart request into (payload, hero_file, gallery_files)."""
+    if request.content_type and 'multipart/form-data' in request.content_type:
+        data = request.form.to_dict()
+        hero_file = request.files.get('hero_image')
+        gallery_files = request.files.getlist('gallery')
+    else:
+        data = request.get_json(silent=True) or {}
+        hero_file, gallery_files = None, []
+
+    def _num(key, cast):
+        v = data.get(key)
+        if v in (None, '', 'null'):
+            return None
+        try:
+            return cast(v)
+        except (TypeError, ValueError):
+            return None
+
+    payload = {
+        'name': (data.get('name') or '').strip(),
+        'location': (data.get('location') or '').strip(),
+        'tagline': (data.get('tagline') or '').strip(),
+        'description': data.get('description') or '',
+        'history': data.get('history') or '',
+        'wildlife': _coerce_park_list(data.get('wildlife')),
+        'animal_stories': _coerce_animal_stories(data.get('animal_stories')),
+        'best_time_to_visit': (data.get('best_time_to_visit') or '').strip(),
+        'area_km2': _num('area_km2', float),
+        'established_year': _num('established_year', int),
+        'display_order': _num('display_order', int) or 0,
+        'is_active': str(data.get('is_active', 'true')).lower() in ('true', '1', 'yes', 'on'),
+    }
+    # Optional pre-existing gallery list (list of URLs) when not uploading new files
+    incoming_gallery = _coerce_park_list(data.get('gallery'))
+    return payload, hero_file, gallery_files, incoming_gallery
+
+
 def register_routes(app, mail):
     
     @app.route("/api/test-email", methods=["GET"])
     def test_email():
         try:
-            html_content = generate_email_template(
+            msg = Message(subject="TEST EMAIL FROM JOZTEMBO TOURS", recipients=["tembo4401@gmail.com"])
+            set_email_html(
+                msg,
                 "Test Email Successful!",
                 "<p>Congratulations! Your HTML emails with the logo are working perfectly.</p>"
             )
-            msg = Message(subject="TEST EMAIL FROM JOZTEMBO TOURS", recipients=["tembo4401@gmail.com"])
-            msg.html = html_content
             mail.send(msg)
             return "<h1>SUCCESS! The styled email was sent. Check your inbox.</h1>", 200
         except Exception as e:
@@ -447,7 +583,8 @@ def register_routes(app, mail):
 
     @app.route('/uploads/<path:folder>/<path:filename>')
     def serve_upload(folder, filename):
-        allowed_folders = {'reviews', 'packages', 'excursions', 'avatars', 'blog', 'about'}
+        # 'parks' added for forward-compat; existing folders unchanged.
+        allowed_folders = {'reviews', 'packages', 'excursions', 'avatars', 'blog', 'about', 'parks'}
         if folder not in allowed_folders:
             return jsonify({'success': False, 'error': 'File not found'}), 404
         upload_folder = os.path.join(app.config['UPLOAD_FOLDER'], folder)
@@ -456,6 +593,7 @@ def register_routes(app, mail):
         response.headers['X-Content-Type-Options'] = 'nosniff'
         return response
 
+    # ================= AUTH =================
     @app.route("/api/auth/register", methods=["POST"])
     def register():
         try:
@@ -536,6 +674,7 @@ def register_routes(app, mail):
             db.session.rollback()
             return jsonify({'success': False, 'error': str(e)}), 500
 
+    # ================= ADMIN MANAGEMENT =================
     @app.route("/api/admin/admins", methods=["GET"])
     @super_admin_required
     def get_all_admins():
@@ -686,6 +825,7 @@ def register_routes(app, mail):
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)}), 500
 
+    # ================= REVIEWS =================
     @app.route("/api/reviews", methods=["GET"])
     def get_reviews():
         try:
@@ -879,6 +1019,7 @@ def register_routes(app, mail):
             db.session.rollback()
             return jsonify({'success': False, 'error': str(e)}), 500
 
+    # ================= PACKAGE CATEGORIES =================
     @app.route("/api/package-categories", methods=["GET"])
     def get_package_categories():
         try:
@@ -905,14 +1046,33 @@ def register_routes(app, mail):
             db.session.rollback()
             return jsonify({'success': False, 'error': str(e)}), 500
 
+    # ================= PACKAGES =================
     @app.route("/api/packages", methods=["GET"])
     def get_packages():
         try:
             category = request.args.get('category')
             featured = request.args.get('featured', type=bool)
+            park_id = request.args.get('park_id', type=int)
+            park_slug = request.args.get('park')
+
             query = Package.query.filter_by(is_active=True)
-            if category: query = query.join(PackageCategory).filter(PackageCategory.slug == category)
-            if featured is not None: query = query.filter_by(is_featured=featured)
+            if category:
+                query = query.join(PackageCategory).filter(PackageCategory.slug == category)
+            if featured is not None:
+                query = query.filter_by(is_featured=featured)
+            if park_id:
+                query = query.filter(Package.park_id == park_id)
+            elif park_slug:
+                park = Park.query.filter_by(slug=park_slug, is_active=True).first()
+                if park:
+                    pkg_ids = [p.id for p in park.get_packages()]
+                    if pkg_ids:
+                        query = query.filter(Package.id.in_(pkg_ids))
+                    else:
+                        query = query.filter(db.false())
+                else:
+                    query = query.filter(db.false())
+
             packages = query.order_by(Package.display_order, Package.created_at.desc()).all()
             return jsonify({'success': True, 'count': len(packages), 'data': [pkg.to_dict() for pkg in packages]}), 200
         except Exception as e:
@@ -928,6 +1088,14 @@ def register_routes(app, mail):
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)}), 500
 
+    def _resolve_park_id(raw_value):
+        if raw_value in (None, '', 'null', 'undefined'):
+            return None
+        try:
+            return int(raw_value)
+        except (TypeError, ValueError):
+            return None
+
     @app.route("/api/packages", methods=["POST"])
     @permission_required('can_manage_packages')
     def create_package():
@@ -937,7 +1105,6 @@ def register_routes(app, mail):
                 for key in ['prices', 'includes', 'excludes']:
                     if key in data and isinstance(data[key], str):
                         try:
-                            import json
                             data[key] = json.loads(data[key])
                         except: pass
                 files = request.files.getlist('media')
@@ -954,15 +1121,29 @@ def register_routes(app, mail):
                 counter += 1
             prices = data.get('prices', {})
             if isinstance(prices, str):
-                import json
                 prices = json.loads(prices)
-            package = Package(name=data['name'], slug=slug, description=data.get('description', ''), short_description=data.get('short_description', ''), total_days=int(data.get('total_days', 1)), total_nights=int(data.get('total_nights', 0)), full_itinerary=data.get('full_itinerary', ''), category_id=data.get('category_id'), prices={'pax_2': prices.get('pax_2'), 'pax_4': prices.get('pax_4'), 'pax_6': prices.get('pax_6'), 'pax_8': prices.get('pax_8'), 'single_supplement': prices.get('single_supplement'), 'child_price': prices.get('child_price')}, price_notes=data.get('price_notes', ''), includes=data.get('includes', []) if isinstance(data.get('includes'), list) else [], excludes=data.get('excludes', []) if isinstance(data.get('excludes'), list) else [], is_featured=data.get('is_featured') in [True, 'true', 'True', '1'], display_order=int(data.get('display_order', 0)), created_by_id=g.current_user.id)
+            package = Package(
+                name=data['name'], slug=slug,
+                description=data.get('description', ''),
+                short_description=data.get('short_description', ''),
+                total_days=int(data.get('total_days', 1)),
+                total_nights=int(data.get('total_nights', 0)),
+                full_itinerary=data.get('full_itinerary', ''),
+                category_id=data.get('category_id'),
+                park_id=_resolve_park_id(data.get('park_id')),
+                prices={'pax_2': prices.get('pax_2'), 'pax_4': prices.get('pax_4'), 'pax_6': prices.get('pax_6'), 'pax_8': prices.get('pax_8'), 'single_supplement': prices.get('single_supplement'), 'child_price': prices.get('child_price')},
+                price_notes=data.get('price_notes', ''),
+                includes=data.get('includes', []) if isinstance(data.get('includes'), list) else [],
+                excludes=data.get('excludes', []) if isinstance(data.get('excludes'), list) else [],
+                is_featured=data.get('is_featured') in [True, 'true', 'True', '1'],
+                display_order=int(data.get('display_order', 0)),
+                created_by_id=g.current_user.id,
+            )
             db.session.add(package)
             db.session.flush()
             days_data = data.get('itinerary_days')
             if days_data:
                 if isinstance(days_data, str):
-                    import json
                     days_data = json.loads(days_data)
                 for day in days_data:
                     day_obj = PackageDay(package_id=package.id, day_number=day.get('day_number', 1), title=day.get('title', f"Day {day.get('day_number', 1)}"), description=day.get('description', ''), activities=day.get('activities', []), meals=day.get('meals', []), accommodation=day.get('accommodation', ''), park_name=day.get('park_name', ''))
@@ -995,7 +1176,6 @@ def register_routes(app, mail):
                 for key in ['prices', 'includes', 'excludes', 'itinerary_days']:
                     if key in data and isinstance(data[key], str):
                         try:
-                            import json
                             data[key] = json.loads(data[key])
                         except: pass
                 files = request.files.getlist('media')
@@ -1009,6 +1189,7 @@ def register_routes(app, mail):
             if 'total_nights' in data: package.total_nights = int(data['total_nights'])
             if 'full_itinerary' in data: package.full_itinerary = data['full_itinerary']
             if 'category_id' in data: package.category_id = data['category_id']
+            if 'park_id' in data: package.park_id = _resolve_park_id(data['park_id'])
             if 'prices' in data:
                 prices = data['prices']
                 package.prices = {'pax_2': prices.get('pax_2'), 'pax_4': prices.get('pax_4'), 'pax_6': prices.get('pax_6'), 'pax_8': prices.get('pax_8'), 'single_supplement': prices.get('single_supplement'), 'child_price': prices.get('child_price')}
@@ -1125,6 +1306,7 @@ def register_routes(app, mail):
             db.session.rollback()
             return jsonify({'success': False, 'error': str(e)}), 500
 
+    # ================= EXCURSIONS =================
     @app.route("/api/excursions", methods=["GET"])
     def get_excursions():
         try:
@@ -1155,7 +1337,6 @@ def register_routes(app, mail):
                 for key in ['includes', 'excludes']:
                     if key in data and isinstance(data[key], str):
                         try:
-                            import json
                             data[key] = json.loads(data[key])
                         except: pass
                 files = request.files.getlist('media')
@@ -1204,7 +1385,6 @@ def register_routes(app, mail):
                 for key in ['includes', 'excludes']:
                     if key in data and isinstance(data[key], str):
                         try:
-                            import json
                             data[key] = json.loads(data[key])
                         except: pass
                 files = request.files.getlist('media')
@@ -1345,6 +1525,7 @@ def register_routes(app, mail):
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)}), 500
 
+    # ================= TRANSFERS =================
     @app.route("/api/transfers", methods=["GET"])
     def get_transfers():
         try:
@@ -1434,6 +1615,7 @@ def register_routes(app, mail):
             db.session.rollback()
             return jsonify({'success': False, 'error': str(e)}), 500
 
+    # ================= BLOG =================
     @app.route("/api/blog", methods=["GET"])
     def get_blog_posts():
         try:
@@ -1507,7 +1689,6 @@ def register_routes(app, mail):
             tags = data.get('tags', [])
             if isinstance(tags, str):
                 try:
-                    import json
                     tags = json.loads(tags)
                 except Exception:
                     tags = [t.strip() for t in tags.split(',') if t.strip()]
@@ -1553,7 +1734,6 @@ def register_routes(app, mail):
                 tags = data['tags']
                 if isinstance(tags, str):
                     try:
-                        import json
                         tags = json.loads(tags)
                     except Exception:
                         tags = [t.strip() for t in tags.split(',') if t.strip()]
@@ -1639,6 +1819,7 @@ def register_routes(app, mail):
             app.logger.error(f"Community story submission error: {e}")
             return jsonify({'success': False, 'error': str(e)}), 500
 
+    # ================= ABOUT =================
     @app.route("/api/about-images", methods=["GET"])
     def get_about_images():
         try:
@@ -1774,6 +1955,134 @@ def register_routes(app, mail):
             db.session.rollback()
             return jsonify({'success': False, 'error': str(e)}), 500
 
+    # ================= PARKS (NEW) =================
+    @app.route("/api/parks", methods=["GET"])
+    def get_parks():
+        try:
+            parks = Park.query.filter_by(is_active=True)\
+                              .order_by(Park.display_order, Park.name).all()
+            return jsonify({
+                'success': True,
+                'count': len(parks),
+                'data': [p.to_dict() for p in parks]
+            }), 200
+        except Exception as e:
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+    @app.route("/api/parks/slug/<slug>", methods=["GET"])
+    def get_park_by_slug(slug):
+        try:
+            park = Park.query.filter_by(slug=slug, is_active=True).first()
+            if not park:
+                return jsonify({'success': False, 'error': 'Park not found'}), 404
+            return jsonify({'success': True, 'data': park.to_dict(include_packages=True)}), 200
+        except Exception as e:
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+    @app.route("/api/admin/parks", methods=["GET"])
+    @admin_required
+    def admin_get_parks():
+        try:
+            parks = Park.query.order_by(Park.display_order, Park.name).all()
+            return jsonify({'success': True, 'data': [p.to_dict() for p in parks]}), 200
+        except Exception as e:
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+    @app.route("/api/admin/parks", methods=["POST"])
+    @permission_required('can_manage_parks')
+    def create_park():
+        try:
+            payload, hero_file, gallery_files, incoming_gallery = _parse_park_payload()
+            if not payload['name']:
+                return jsonify({'success': False, 'error': 'Name is required'}), 400
+
+            base_slug = _slugify(payload['name'])
+            slug = _unique_park_slug(base_slug)
+
+            allowed_exts = app.config['ALLOWED_IMAGE_EXTENSIONS']
+
+            hero_url = ''
+            if hero_file and hero_file.filename:
+                url, _ = save_uploaded_file(hero_file, 'parks', allowed_exts)
+                if url: hero_url = url
+
+            gallery_urls = list(incoming_gallery or [])
+            for f in gallery_files:
+                if f and f.filename:
+                    url, _ = save_uploaded_file(f, 'parks', allowed_exts)
+                    if url: gallery_urls.append(url)
+
+            park = Park(
+                slug=slug,
+                hero_image=hero_url,
+                gallery=gallery_urls,
+                created_by_id=g.current_user.id,
+                **payload,
+            )
+            db.session.add(park)
+            db.session.commit()
+            return jsonify({'success': True, 'message': 'Park created successfully', 'data': park.to_dict()}), 201
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+    @app.route("/api/admin/parks/<int:park_id>", methods=["PUT"])
+    @permission_required('can_manage_parks')
+    def update_park(park_id):
+        try:
+            park = Park.query.get(park_id)
+            if not park:
+                return jsonify({'success': False, 'error': 'Park not found'}), 404
+
+            payload, hero_file, gallery_files, incoming_gallery = _parse_park_payload()
+
+            # If name changed, regenerate slug to keep URL stable-ish but unique
+            if payload['name'] and payload['name'] != park.name:
+                base_slug = _slugify(payload['name'])
+                park.slug = _unique_park_slug(base_slug, ignore_id=park.id)
+
+            for k, v in payload.items():
+                setattr(park, k, v)
+
+            allowed_exts = app.config['ALLOWED_IMAGE_EXTENSIONS']
+            if hero_file and hero_file.filename:
+                url, _ = save_uploaded_file(hero_file, 'parks', allowed_exts)
+                if url: park.hero_image = url
+
+            # Merge gallery: incoming list + newly uploaded
+            gallery_urls = list(incoming_gallery or park.gallery or [])
+            for f in gallery_files:
+                if f and f.filename:
+                    url, _ = save_uploaded_file(f, 'parks', allowed_exts)
+                    if url: gallery_urls.append(url)
+            park.gallery = gallery_urls
+
+            park.updated_at = datetime.now(UTC)
+            db.session.commit()
+            return jsonify({'success': True, 'message': 'Park updated', 'data': park.to_dict()}), 200
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+    @app.route("/api/admin/parks/<int:park_id>", methods=["DELETE"])
+    @permission_required('can_manage_parks')
+    def delete_park(park_id):
+        try:
+            park = Park.query.get(park_id)
+            if not park:
+                return jsonify({'success': False, 'error': 'Park not found'}), 404
+            park.is_active = False
+            park.updated_at = datetime.now(UTC)
+            db.session.commit()
+            log = AdminActionLog(admin_id=g.current_user.id, action_type='delete', resource_type='park', resource_id=park_id, ip_address=request.remote_addr)
+            db.session.add(log)
+            db.session.commit()
+            return jsonify({'success': True, 'message': 'Park deactivated'}), 200
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+    # ================= CONTACT / INQUIRIES =================
     @app.route("/api/contact", methods=["POST"])
     @optional_auth
     def contact_form():
@@ -1792,12 +2101,11 @@ def register_routes(app, mail):
             phone = (data.get('phone') or '').strip()
             subject = (data.get('subject') or 'General Inquiry').strip()
             message = data['message'].strip()
-            
+
             admin_recipient = app.config.get('MAIL_ADMIN_RECIPIENT', 'info@joztembotours.com')
             sender = app.config.get('MAIL_DEFAULT_SENDER') or app.config.get('MAIL_USERNAME')
             ticket_id = f"JT-{uuid.uuid4().hex[:8].upper()}"
-            
-            # 1. ADMIN EMAIL
+
             admin_html = f"""
             <h3>New Contact Form Submission</h3>
             <p><strong>Name:</strong> {name}</p>
@@ -1812,9 +2120,8 @@ def register_routes(app, mail):
             admin_msg = Message(subject=f"[{ticket_id}] {subject} — from {name}", recipients=[admin_recipient])
             if sender: admin_msg.sender = sender
             if email: admin_msg.reply_to = email
-            admin_msg.html = generate_email_template(f"Contact Form: {ticket_id}", admin_html)
+            set_email_html(admin_msg, f"Contact Form: {ticket_id}", admin_html)
 
-            # 2. CUSTOMER EMAIL
             customer_html = f"""
             <h3>Hi {name},</h3>
             <p>We have received your message and our team will get back to you within 24 hours.</p>
@@ -1827,9 +2134,8 @@ def register_routes(app, mail):
             """
             customer_msg = Message(subject=f"We received your message — {ticket_id}", recipients=[email])
             if sender: customer_msg.sender = sender
-            customer_msg.html = generate_email_template("Message Received", customer_html)
+            set_email_html(customer_msg, "Message Received", customer_html)
 
-            # SEND BOTH AT THE SAME TIME
             with mail.connect() as conn:
                 conn.send(admin_msg)
                 conn.send(customer_msg)
@@ -1839,8 +2145,6 @@ def register_routes(app, mail):
         except Exception as e:
             app.logger.error(f"Contact form error: {e}")
             return jsonify({'success': False, 'error': f'Failed to send message: {str(e)}'}), 500
-
-       
 
     @app.route("/api/transfer-quick-inquiry", methods=["POST"])
     def create_quick_transfer_inquiry():
@@ -1922,8 +2226,7 @@ def register_routes(app, mail):
             if sender:
                 admin_message.sender = sender
             admin_message.reply_to = email
-            admin_message.html = generate_email_template("New Transfer Request", admin_html)
-
+            set_email_html(admin_message, "New Transfer Request", admin_html)
             customer_html = f"""
                 <p>Hello {name},</p>
                 <p>Thank you for choosing <strong>Joz Tembo Tours &amp; Safari</strong>.
@@ -1946,8 +2249,7 @@ def register_routes(app, mail):
             )
             if sender:
                 customer_message.sender = sender
-            customer_message.html = generate_email_template("We’ve Received Your Request", customer_html)
-
+            set_email_html(customer_message, "We’ve Received Your Request", customer_html)
             with mail.connect() as connection:
                 connection.send(admin_message)
                 connection.send(customer_message)
@@ -1975,8 +2277,7 @@ def register_routes(app, mail):
                 if not data.get(field): return jsonify({'success': False, 'error': f'{field} is required'}), 400
             email_pattern = re.compile(r'^[^\s@]+@[^\s@]+\.[^\s@]+$')
             if not email_pattern.match(str(data['email'])): return jsonify({'success': False, 'error': 'Invalid email format'}), 400
-            
-            # Generate Reference Number
+
             ref_prefix = {'package': 'PKG', 'excursion': 'EXC', 'transfer': 'TRF'}.get(data['type'], 'INQ')
             reference_code = f"JT-{ref_prefix}-{uuid.uuid4().hex[:6].upper()}"
 
@@ -2023,13 +2324,12 @@ def register_routes(app, mail):
                 unit_price = float(chosen_rate or 0)
                 pricing_label = f"Transfer tier for {pax_n} pax"
             else: return jsonify({'success': False, 'error': 'Invalid inquiry type'}), 400
-            
+
             pax = max(1, int(data.get('pax') or 1))
             price_estimate = unit_price * pax
             admin_recipient = app.config.get('MAIL_ADMIN_RECIPIENT', 'info@joztembotours.com')
             sender = app.config.get('MAIL_DEFAULT_SENDER') or app.config.get('MAIL_USERNAME')
 
-            # 1. ADMIN EMAIL
             admin_html = f"""
             <h3>New {data['type'].title()} Inquiry</h3>
             <p><strong>Reference:</strong> {reference_code}</p>
@@ -2048,9 +2348,7 @@ def register_routes(app, mail):
             msg = Message(subject=f"[{reference_code}] New {data['type'].title()} Inquiry — {resolved_name}", recipients=[admin_recipient])
             if sender: msg.sender = sender
             if data.get('email'): msg.reply_to = data['email']
-            msg.html = generate_email_template(f"Inquiry: {reference_code}", admin_html)
-
-            # 2. CUSTOMER EMAIL
+            set_email_html(msg, f"Inquiry: {reference_code}", admin_html)
             customer_html = f"""
             <h3>Hi {data['name']},</h3>
             <p>Our team is currently working on your inquiry for <strong>{resolved_name}</strong>. We will get back to you shortly with more details.</p>
@@ -2064,20 +2362,18 @@ def register_routes(app, mail):
             """
             confirm = Message(subject=f"We received your inquiry — {reference_code}", recipients=[data['email']])
             if sender: confirm.sender = sender
-            confirm.html = generate_email_template("Inquiry Received", customer_html)
-
-            # SEND BOTH AT THE SAME TIME
+            set_email_html(confirm, "Inquiry Received", customer_html)
             with mail.connect() as conn:
                 conn.send(msg)
                 conn.send(confirm)
 
             return jsonify({
-                'success': True, 
-                'message': 'Inquiry received. We will contact you shortly.', 
+                'success': True,
+                'message': 'Inquiry received. We will contact you shortly.',
                 'reference_code': reference_code,
-                'price_estimate': price_estimate, 
-                'currency': currency, 
-                'pax': pax, 
+                'price_estimate': price_estimate,
+                'currency': currency,
+                'pax': pax,
                 'pricing_label': pricing_label
             }), 201
         except Exception as e:
@@ -2086,7 +2382,9 @@ def register_routes(app, mail):
 
     @app.route("/")
     def index():
-        return jsonify({"message": "🦁 Joztembo Tours - Backend API", "version": "3.7"}), 200
+        return jsonify({"message": "🦁 Joztembo Tours - Backend API", "version": "3.8"}), 200
+
+
 load_dotenv()
 
 app = create_app()
