@@ -15,6 +15,7 @@ python-dotenv = "*"
 pillow = "*"
 gunicorn = "*"
 cloudinary = "*"
+resend = "*"
 
 [dev-packages]
 

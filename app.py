@@ -1,6 +1,5 @@
-# app.py - Complete Backend with Admin Hierarchy, Reviews, Packages, Excursions, Transfers, Blog, About, Community Stories, Parks
+# app.py - Complete Backend (Switched to Resend API for Render compatibility)
 from flask import Flask, request, jsonify, g, send_from_directory, current_app
-from flask_mail import Mail, Message
 from flask_cors import CORS
 from datetime import datetime, timezone, timedelta
 from functools import wraps
@@ -19,6 +18,8 @@ import cloudinary.uploader
 from werkzeug.utils import secure_filename
 from logging.handlers import RotatingFileHandler
 
+import resend
+
 from config import Config, DevelopmentConfig, ProductionConfig, TestingConfig
 from extensions import db, migrate
 
@@ -36,18 +37,6 @@ from models import (
 UTC = timezone.utc
 MAX_EXCURSION_MEDIA = 4
 
-# Logo is embedded INSIDE each email (CID inline attachment) so it always shows,
-# even when the email client blocks remote images or the website is unreachable.
-# Put the file at: <backend folder>/static/joz-logo-email.png
-LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "joz-logo-email.png")
-LOGO_CID = "joz-logo"
-
-try:
-    from importlib.metadata import version as _pkg_version
-    _FLASK_MAIL_DICT_HEADERS = tuple(int(x) for x in _pkg_version("Flask-Mail").split(".")[:2]) >= (0, 10)
-except Exception:
-    _FLASK_MAIL_DICT_HEADERS = True
-# Fallback only used if the local file is missing
 LOGO_URL = "https://temboexpedition.vercel.app/joz-logo.png"
 
 def _parse_origins():
@@ -56,9 +45,8 @@ def _parse_origins():
     defaults = [
         'http://localhost:5173', 'http://127.0.0.1:5173',
         'http://localhost:3000', 'http://127.0.0.1:3000',
-        # Adding both spellings to be safe
         'https://temboexpedition.vercel.app',
-        'https://temboexpedition.vercel.app',
+        'https://temboexpeditions.vercel.app',
         'https://backend-tembo-expeditions.onrender.com',
     ]
     for d in defaults:
@@ -69,13 +57,9 @@ def _parse_origins():
 def _cors_regex():
     allowed = _parse_origins()
     escaped = [re.escape(o) for o in allowed]
-    # The [s]? makes the 's' optional, catching both spellings and all Vercel preview URLs
     escaped.append(r'https://temboexpedition[s]?.*\.vercel\.app')
     return r'^(' + '|'.join(escaped) + r')$'
 
-# ============================================================
-# HTML EMAIL TEMPLATE HELPER
-# ============================================================
 def generate_email_template(title, content_html, footer_message="Joz Tembo Tours & Safari", logo_src=None):
     logo_src = logo_src or LOGO_URL
     return f"""
@@ -117,23 +101,6 @@ def generate_email_template(title, content_html, footer_message="Joz Tembo Tours
     </html>
     """
 
-def set_email_html(msg, title, content_html, footer_message="Joz Tembo Tours & Safari"):
-    """Build the branded HTML and embed the logo into the message."""
-    logo_src = None
-    try:
-        with open(LOGO_PATH, "rb") as f:
-            logo_bytes = f.read()
-        # Flask-Mail >= 0.10 wants headers as a dict; older versions want a list of tuples
-        logo_headers = {"Content-ID": f"<{LOGO_CID}>", "X-Attachment-Id": LOGO_CID}
-        if not _FLASK_MAIL_DICT_HEADERS:
-            logo_headers = list(logo_headers.items())
-        msg.attach("joz-logo.png", "image/png", logo_bytes, "inline", headers=logo_headers)
-        logo_src = f"cid:{LOGO_CID}"
-    except OSError:
-        logging.getLogger(__name__).warning("Email logo not found at %s - using URL fallback", LOGO_PATH)
-    msg.html = generate_email_template(title, content_html, footer_message, logo_src=logo_src)
-    return msg
-
 def create_app(config_class=None):
     app = Flask(__name__)
 
@@ -151,10 +118,11 @@ def create_app(config_class=None):
     app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', app.config.get('SECRET_KEY'))
     app.config['JWT_EXPIRATION_HOURS'] = 168
 
+    resend.api_key = os.environ.get("RESEND_API_KEY")
+
     configured_upload_folder = os.environ.get('UPLOAD_FOLDER') or app.config.get('UPLOAD_FOLDER') or 'uploads'
     app.config['UPLOAD_FOLDER'] = os.path.abspath(configured_upload_folder)
     upload_base = app.config['UPLOAD_FOLDER']
-    # NOTE: 'parks' added for forward-compat. Existing folders unchanged.
     for folder in ['reviews', 'packages', 'excursions', 'avatars', 'blog', 'about', 'parks']:
         os.makedirs(os.path.join(upload_base, folder), exist_ok=True)
 
@@ -176,7 +144,6 @@ def create_app(config_class=None):
     db.init_app(app)
     migrate.init_app(app, db)
 
-    # --- UPDATED CORS CONFIGURATION ---
     CORS(
         app,
         resources={
@@ -189,7 +156,7 @@ def create_app(config_class=None):
                 "max_age": 3600,
             },
             r"/uploads/*": {
-                "origins": "*", # Uploads can be public
+                "origins": "*",
                 "methods": ["GET", "OPTIONS"],
                 "allow_headers": ["Content-Type"],
             },
@@ -212,8 +179,6 @@ def create_app(config_class=None):
             return jsonify({'success': False, 'error': 'HTTPS required', 'redirect': url}), 426
         return None
 
-    mail = Mail(app)
-
     @app.route("/api/health", methods=["GET"])
     def _health_early():
         return jsonify({
@@ -221,12 +186,12 @@ def create_app(config_class=None):
             "timestamp": datetime.now(UTC).isoformat(),
             "environment": os.environ.get('FLASK_ENV', 'development'),
             "cors_origins": _parse_origins(),
-            "mail_configured": bool(app.config.get('MAIL_SERVER')), # Fixed missing closing parenthesis here
+            "resend_configured": bool(resend.api_key),
             "cloudinary_configured": bool(app.config.get('CLOUDINARY_ENABLED')),
         }), 200
 
     setup_logging(app)
-    register_routes(app, mail)
+    register_routes(app)
 
     with app.app_context():
         try:
@@ -398,7 +363,6 @@ def save_uploaded_file(file, folder, allowed_extensions):
         'mime_type': mime_type
     }
 
-
 def get_upload_file_path(file_url):
     if not file_url or not file_url.startswith('/uploads/'):
         return None
@@ -407,7 +371,6 @@ def get_upload_file_path(file_url):
     if len(path_parts) != 2 or any(part in ('', '.', '..') for part in path_parts):
         return None
     return os.path.join(current_app.config['UPLOAD_FOLDER'], *path_parts)
-
 
 def delete_uploaded_file(file_url):
     if not file_url:
@@ -454,7 +417,6 @@ def delete_uploaded_file(file_url):
         current_app.logger.exception("Cloudinary media deletion failed")
         return False
 
-
 def get_media_type(filename):
     ext = filename.rsplit('.', 1)[1].lower() if '.' in filename else ''
     image_exts = {'png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'tiff', 'ico'}
@@ -463,14 +425,9 @@ def get_media_type(filename):
     elif ext in video_exts: return 'video'
     return None
 
-
-# ------------------------------------------------------------------
-# PARK HELPERS
-# ------------------------------------------------------------------
 def _slugify(text):
     slug = re.sub(r'[^a-z0-9]+', '-', (text or '').lower()).strip('-')
     return slug or f"park-{uuid.uuid4().hex[:8]}"
-
 
 def _unique_park_slug(base_slug, ignore_id=None):
     slug = base_slug
@@ -486,9 +443,7 @@ def _unique_park_slug(base_slug, ignore_id=None):
             q = q.filter(Park.id != ignore_id)
     return slug
 
-
 def _coerce_park_list(value):
-    """Accept JSON list, JSON string, or newline/comma string → list."""
     if value is None:
         return []
     if isinstance(value, list):
@@ -500,13 +455,10 @@ def _coerce_park_list(value):
                 return parsed
         except Exception:
             pass
-        # Fallback: split on newlines
         return [line.strip() for line in value.split('\n') if line.strip()]
     return []
 
-
 def _coerce_animal_stories(value):
-    """Accept list of {name, story}, JSON string, or 'Name :: Story' lines."""
     if value is None:
         return []
     if isinstance(value, list):
@@ -531,9 +483,7 @@ def _coerce_animal_stories(value):
         return out
     return []
 
-
 def _parse_park_payload():
-    """Parse JSON or multipart request into (payload, hero_file, gallery_files)."""
     if request.content_type and 'multipart/form-data' in request.content_type:
         data = request.form.to_dict()
         hero_file = request.files.get('hero_image')
@@ -565,30 +515,39 @@ def _parse_park_payload():
         'display_order': _num('display_order', int) or 0,
         'is_active': str(data.get('is_active', 'true')).lower() in ('true', '1', 'yes', 'on'),
     }
-    # Optional pre-existing gallery list (list of URLs) when not uploading new files
     incoming_gallery = _coerce_park_list(data.get('gallery'))
     return payload, hero_file, gallery_files, incoming_gallery
 
-
-def register_routes(app, mail):
+def register_routes(app):
     
     @app.route("/api/test-email", methods=["GET"])
     def test_email():
         try:
-            msg = Message(subject="TEST EMAIL FROM JOZTEMBO TOURS", recipients=["tembo4401@gmail.com"])
-            set_email_html(
-                msg,
+            admin_email = os.environ.get('MAIL_ADMIN_RECIPIENT', 'info@joztembotours.com')
+            
+            # FORCE Resend Test domain to bypass config.py overrides
+            sender_email = "onboarding@resend.dev"
+            
+            html_body = generate_email_template(
                 "Test Email Successful!",
-                "<p>Congratulations! Your HTML emails with the logo are working perfectly.</p>"
+                f"<p>Congratulations! Your HTML emails via Resend API are working perfectly.</p><p><b>Sender:</b> {sender_email}<br><b>Recipient:</b> {admin_email}</p>"
             )
-            mail.send(msg)
-            return "<h1>SUCCESS! The styled email was sent. Check your inbox.</h1>", 200
+            
+            params = {
+                "from": f"Joz Tembo Tours <{sender_email}>",
+                "to": [admin_email],
+                "subject": "TEST EMAIL FROM JOZTEMBO TOURS (Resend API)",
+                "html": html_body
+            }
+            resend.Emails.send(params)
+            
+            return f"<h1>SUCCESS! The styled email was sent to {admin_email} via Resend.</h1><p>Check your inbox and spam folder.</p>", 200
         except Exception as e:
-            return f"<h1>FAILED TO SEND EMAIL</h1><p>Error: {str(e)}</p>", 500
+            app.logger.error(f"Test email failed: {str(e)}")
+            return f"<h1>FAILED TO SEND EMAIL</h1><p>Error: {str(e)}</p><p>Check your API key and domain verification.</p>", 500
 
     @app.route('/uploads/<path:folder>/<path:filename>')
     def serve_upload(folder, filename):
-        # 'parks' added for forward-compat; existing folders unchanged.
         allowed_folders = {'reviews', 'packages', 'excursions', 'avatars', 'blog', 'about', 'parks'}
         if folder not in allowed_folders:
             return jsonify({'success': False, 'error': 'File not found'}), 404
@@ -2107,9 +2066,12 @@ def register_routes(app, mail):
             subject = (data.get('subject') or 'General Inquiry').strip()
             message = data['message'].strip()
 
-            admin_recipient = app.config.get('MAIL_ADMIN_RECIPIENT', 'info@joztembotours.com')
-            sender = app.config.get('MAIL_DEFAULT_SENDER') or app.config.get('MAIL_USERNAME')
+            admin_recipient = os.environ.get('MAIL_ADMIN_RECIPIENT', 'info@joztembotours.com')
+            sender = os.environ.get('MAIL_DEFAULT_SENDER', 'onboarding@resend.dev')
             ticket_id = f"JT-{uuid.uuid4().hex[:8].upper()}"
+
+            # Hardcoded fix to prevent config.py overrides
+            sender = "onboarding@resend.dev"
 
             admin_html = f"""
             <h3>New Contact Form Submission</h3>
@@ -2122,10 +2084,14 @@ def register_routes(app, mail):
                 <p>{message}</p>
             </div>
             """
-            admin_msg = Message(subject=f"[{ticket_id}] {subject} — from {name}", recipients=[admin_recipient])
-            if sender: admin_msg.sender = sender
-            if email: admin_msg.reply_to = email
-            set_email_html(admin_msg, f"Contact Form: {ticket_id}", admin_html)
+            admin_msg_params = {
+                "from": f"Joz Tembo Tours <{sender}>",
+                "to": [admin_recipient],
+                "reply_to": email,
+                "subject": f"[{ticket_id}] {subject} — from {name}",
+                "html": generate_email_template(f"Contact Form: {ticket_id}", admin_html)
+            }
+            resend.Emails.send(admin_msg_params)
 
             customer_html = f"""
             <h3>Hi {name},</h3>
@@ -2137,13 +2103,14 @@ def register_routes(app, mail):
             <p>Your message:</p>
             <p style="color: #666; font-style: italic;">"{message}"</p>
             """
-            customer_msg = Message(subject=f"We received your message — {ticket_id}", recipients=[email])
-            if sender: customer_msg.sender = sender
-            set_email_html(customer_msg, "Message Received", customer_html)
-
-            with mail.connect() as conn:
-                conn.send(admin_msg)
-                conn.send(customer_msg)
+            customer_msg_params = {
+                "from": f"Joz Tembo Tours <{sender}>",
+                # --- LOCAL TESTING FIX: Sending to admin instead of customer ---
+                "to": [admin_recipient], 
+                "subject": f"We received your message — {ticket_id}",
+                "html": generate_email_template("Message Received", customer_html)
+            }
+            resend.Emails.send(customer_msg_params)
 
             app.logger.info(f"Contact form submitted: {ticket_id} from {email} ({subject})")
             return jsonify({'success': True, 'message': 'Message sent successfully', 'ticket_id': ticket_id}), 201
@@ -2191,8 +2158,10 @@ def register_routes(app, mail):
             dropoff = escape(str(data["dropoff_location"]).strip())
             date_time = escape(str(data["date_time"]).strip())
             transfer_label = "Airport to Hotel" if transfer_type == "airport-to-hotel" else "Hotel to Airport"
-            admin_recipient = app.config.get("MAIL_ADMIN_RECIPIENT", "info@joztembotours.com")
-            sender = app.config.get("MAIL_DEFAULT_SENDER") or app.config.get("MAIL_USERNAME")
+            admin_recipient = os.environ.get("MAIL_ADMIN_RECIPIENT", "info@joztembotours.com")
+            
+            # Hardcoded fix to prevent config.py overrides
+            sender = "onboarding@resend.dev"
 
             details_html = f"""
                 <table role="presentation" width="100%" cellpadding="0" cellspacing="0"
@@ -2224,14 +2193,15 @@ def register_routes(app, mail):
                 {details_html}
                 <p style="margin-top:22px;">Reply directly to this email to contact the customer at {escape(email)}.</p>
             """
-            admin_message = Message(
-                subject=f"[{reference_code}] New transfer request — {name}",
-                recipients=[admin_recipient]
-            )
-            if sender:
-                admin_message.sender = sender
-            admin_message.reply_to = email
-            set_email_html(admin_message, "New Transfer Request", admin_html)
+            admin_message_params = {
+                "from": f"Joz Tembo Tours <{sender}>",
+                "to": [admin_recipient],
+                "reply_to": email,
+                "subject": f"[{reference_code}] New transfer request — {name}",
+                "html": generate_email_template("New Transfer Request", admin_html)
+            }
+            resend.Emails.send(admin_message_params)
+
             customer_html = f"""
                 <p>Hello {name},</p>
                 <p>Thank you for choosing <strong>Joz Tembo Tours &amp; Safari</strong>.
@@ -2248,16 +2218,14 @@ def register_routes(app, mail):
                 <p>We look forward to making your journey comfortable and seamless.</p>
                 <p style="margin-bottom:0;"><strong>Joz Tembo Tours &amp; Safari</strong></p>
             """
-            customer_message = Message(
-                subject=f"Transfer request received — {reference_code}",
-                recipients=[email]
-            )
-            if sender:
-                customer_message.sender = sender
-            set_email_html(customer_message, "We’ve Received Your Request", customer_html)
-            with mail.connect() as connection:
-                connection.send(admin_message)
-                connection.send(customer_message)
+            customer_message_params = {
+                "from": f"Joz Tembo Tours <{sender}>",
+                # --- LOCAL TESTING FIX: Sending to admin instead of customer ---
+                "to": [admin_recipient], 
+                "subject": f"Transfer request received — {reference_code}",
+                "html": generate_email_template("We’ve Received Your Request", customer_html)
+            }
+            resend.Emails.send(customer_message_params)
 
             app.logger.info("Quick transfer inquiry %s received from %s", reference_code, email)
             return jsonify({
@@ -2270,7 +2238,7 @@ def register_routes(app, mail):
             app.logger.exception("Quick transfer inquiry email failed")
             return jsonify({
                 "success": False,
-                "error": "We could not send your request right now. Please try again or contact us directly."
+                "error": f"We could not send your request right now: {str(e)}"
             }), 500
 
     @app.route("/api/inquiries", methods=["POST"])
@@ -2332,8 +2300,10 @@ def register_routes(app, mail):
 
             pax = max(1, int(data.get('pax') or 1))
             price_estimate = unit_price * pax
-            admin_recipient = app.config.get('MAIL_ADMIN_RECIPIENT', 'info@joztembotours.com')
-            sender = app.config.get('MAIL_DEFAULT_SENDER') or app.config.get('MAIL_USERNAME')
+            admin_recipient = os.environ.get('MAIL_ADMIN_RECIPIENT', 'info@joztembotours.com')
+            
+            # Hardcoded fix to prevent config.py overrides
+            sender = "onboarding@resend.dev"
 
             admin_html = f"""
             <h3>New {data['type'].title()} Inquiry</h3>
@@ -2350,10 +2320,15 @@ def register_routes(app, mail):
             <p><strong>Message:</strong></p>
             <p style="color: #666; font-style: italic;">"{data.get('message', 'No message provided.')}"</p>
             """
-            msg = Message(subject=f"[{reference_code}] New {data['type'].title()} Inquiry — {resolved_name}", recipients=[admin_recipient])
-            if sender: msg.sender = sender
-            if data.get('email'): msg.reply_to = data['email']
-            set_email_html(msg, f"Inquiry: {reference_code}", admin_html)
+            msg_params = {
+                "from": f"Joz Tembo Tours <{sender}>",
+                "to": [admin_recipient],
+                "reply_to": data['email'],
+                "subject": f"[{reference_code}] New {data['type'].title()} Inquiry — {resolved_name}",
+                "html": generate_email_template(f"Inquiry: {reference_code}", admin_html)
+            }
+            resend.Emails.send(msg_params)
+
             customer_html = f"""
             <h3>Hi {data['name']},</h3>
             <p>Our team is currently working on your inquiry for <strong>{resolved_name}</strong>. We will get back to you shortly with more details.</p>
@@ -2365,12 +2340,14 @@ def register_routes(app, mail):
             </div>
             <p>Thank you for considering Joz Tembo Tours for your safari adventure.</p>
             """
-            confirm = Message(subject=f"We received your inquiry — {reference_code}", recipients=[data['email']])
-            if sender: confirm.sender = sender
-            set_email_html(confirm, "Inquiry Received", customer_html)
-            with mail.connect() as conn:
-                conn.send(msg)
-                conn.send(confirm)
+            confirm_params = {
+                "from": f"Joz Tembo Tours <{sender}>",
+                # --- LOCAL TESTING FIX: Sending to admin instead of customer ---
+                "to": [admin_recipient], 
+                "subject": f"We received your inquiry — {reference_code}",
+                "html": generate_email_template("Inquiry Received", customer_html)
+            }
+            resend.Emails.send(confirm_params)
 
             return jsonify({
                 'success': True,
@@ -2387,8 +2364,7 @@ def register_routes(app, mail):
 
     @app.route("/")
     def index():
-        return jsonify({"message": "🦁 Joztembo Tours - Backend API", "version": "3.8"}), 200
-
+        return jsonify({"message": "🦁 Joztembo Tours - Backend API (Resend API)", "version": "4.0"}), 200
 
 load_dotenv()
 
