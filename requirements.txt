@@ -18,3 +18,4 @@ python-dotenv==1.2.3
 SQLAlchemy==2.0.54
 Werkzeug==3.1.8
 cloudinary==1.33.0
+resend==2.52.0
