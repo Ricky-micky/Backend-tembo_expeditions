@@ -1,9 +1,12 @@
-# app.py - Complete Backend (Switched to Resend API for Render compatibility)
+# app.py - Complete Backend (Resend API for Render compatibility)
+# NOTE: load_dotenv() MUST run before config is imported, so it is first.
+from dotenv import load_dotenv
+load_dotenv()
+
 from flask import Flask, request, jsonify, g, send_from_directory, current_app
 from flask_cors import CORS
 from datetime import datetime, timezone, timedelta
 from functools import wraps
-from dotenv import load_dotenv
 import os
 import logging
 import re
@@ -38,6 +41,8 @@ UTC = timezone.utc
 MAX_EXCURSION_MEDIA = 4
 
 LOGO_URL = "https://temboexpedition.vercel.app/joz-logo.png"
+EMAIL_REGEX = re.compile(r'^[^\s@]+@[^\s@]+\.[^\s@]+$')
+
 
 def _parse_origins():
     raw = os.environ.get('ALLOWED_ORIGINS', '')
@@ -54,11 +59,13 @@ def _parse_origins():
             origins.append(d)
     return origins
 
+
 def _cors_regex():
     allowed = _parse_origins()
     escaped = [re.escape(o) for o in allowed]
     escaped.append(r'https://temboexpedition[s]?.*\.vercel\.app')
     return r'^(' + '|'.join(escaped) + r')$'
+
 
 def generate_email_template(title, content_html, footer_message="Joz Tembo Tours & Safari", logo_src=None):
     logo_src = logo_src or LOGO_URL
@@ -100,6 +107,98 @@ def generate_email_template(title, content_html, footer_message="Joz Tembo Tours
     </body>
     </html>
     """
+
+
+# ================= EMAIL HELPERS =================
+def get_sender():
+    sender = (os.environ.get('MAIL_DEFAULT_SENDER') or '').strip()
+    if not sender:
+        return 'onboarding@resend.dev'
+    domain = sender.lower().rsplit('@', 1)[-1]
+    if domain in FREE_MAIL_DOMAINS:
+        # Resend cannot send from Gmail/Yahoo/etc. Fall back to the test sender.
+        return 'onboarding@resend.dev'
+    return sender
+
+
+def get_admin_recipient():
+    return os.environ.get('MAIL_ADMIN_RECIPIENT') or 'info@joztembotours.com'
+
+
+FREE_MAIL_DOMAINS = {
+    'gmail.com', 'googlemail.com', 'yahoo.com', 'outlook.com',
+    'hotmail.com', 'icloud.com', 'proton.me', 'protonmail.com',
+}
+
+
+def domain_is_verified():
+    """True only for a custom domain. Resend's test sender (resend.dev) and free mail
+    providers (Gmail etc.) cannot send to arbitrary customers, so they stay in test mode."""
+    domain = get_sender().lower().rsplit('@', 1)[-1]
+    return domain != 'resend.dev' and domain not in FREE_MAIL_DOMAINS
+
+
+def send_email(to, subject, html, reply_to=None):
+    params = {
+        "from": f"Joz Tembo Tours <{get_sender()}>",
+        "to": to if isinstance(to, list) else [to],
+        "subject": subject,
+        "html": html,
+    }
+    if reply_to:
+        params["reply_to"] = reply_to
+    return resend.Emails.send(params)
+
+
+def notify_both(app, customer_email, customer_name,
+                admin_subject, admin_html, admin_title,
+                customer_subject, customer_html, customer_title):
+    """
+    1) Always emails the admin (must succeed, otherwise an exception is raised).
+    2) Then emails the customer. If the Resend domain is not verified yet, the
+       customer copy is redirected to the admin as a preview. A failure here is
+       only logged so the user still gets a success response.
+    Returns (admin_ok, delivered_to_real_customer).
+    """
+    admin_to = get_admin_recipient()
+
+    send_email(
+        admin_to, admin_subject,
+        generate_email_template(admin_title, admin_html),
+        reply_to=customer_email,
+    )
+
+    try:
+        if domain_is_verified():
+            send_email(
+                customer_email, customer_subject,
+                generate_email_template(customer_title, customer_html),
+                reply_to=admin_to,
+            )
+            return True, True
+
+        preview = (
+            f'<div class="highlight-box"><strong>TEST MODE:</strong> this copy was meant for '
+            f'{escape(customer_name)} &lt;{escape(customer_email)}&gt;. Verify your domain in '
+            f'Resend to deliver it to customers.</div>'
+        )
+        send_email(
+            admin_to, f"[CUSTOMER COPY] {customer_subject}",
+            generate_email_template(customer_title, preview + customer_html),
+        )
+        return True, False
+    except Exception as e:
+        app.logger.error(f"Customer email failed for {customer_email}: {e}")
+        return True, False
+
+
+def parse_pax(value, default=1):
+    """Handles ints, numeric strings and '10+'."""
+    try:
+        return max(1, int(str(value).replace('+', '').strip()))
+    except (TypeError, ValueError):
+        return default
+
 
 def create_app(config_class=None):
     app = Flask(__name__)
@@ -187,6 +286,8 @@ def create_app(config_class=None):
             "environment": os.environ.get('FLASK_ENV', 'development'),
             "cors_origins": _parse_origins(),
             "resend_configured": bool(resend.api_key),
+            "email_sender": get_sender(),
+            "customer_emails_enabled": domain_is_verified(),
             "cloudinary_configured": bool(app.config.get('CLOUDINARY_ENABLED')),
         }), 200
 
@@ -212,6 +313,7 @@ def create_app(config_class=None):
 
     return app
 
+
 def setup_logging(app):
     if not os.path.exists('logs'):
         os.mkdir('logs')
@@ -225,6 +327,7 @@ def setup_logging(app):
     app.logger.addHandler(console_handler)
     app.logger.setLevel(logging.INFO)
     app.logger.info('🦁 Joztembo Tours Backend Startup')
+
 
 def login_required(f):
     @wraps(f)
@@ -240,6 +343,7 @@ def login_required(f):
         g.current_user = user
         return f(*args, **kwargs)
     return decorated_function
+
 
 def admin_required(f):
     @wraps(f)
@@ -257,6 +361,7 @@ def admin_required(f):
         g.current_user = user
         return f(*args, **kwargs)
     return decorated_function
+
 
 def super_admin_required(f):
     @wraps(f)
@@ -276,6 +381,7 @@ def super_admin_required(f):
         g.current_user = user
         return f(*args, **kwargs)
     return decorated_function
+
 
 def permission_required(permission_method):
     def decorator(f):
@@ -299,6 +405,7 @@ def permission_required(permission_method):
         return decorated_function
     return decorator
 
+
 def optional_auth(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
@@ -311,8 +418,10 @@ def optional_auth(f):
         return f(*args, **kwargs)
     return decorated_function
 
+
 def allowed_file(filename, allowed_extensions):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in allowed_extensions
+
 
 def save_uploaded_file(file, folder, allowed_extensions):
     if not file or not file.filename:
@@ -363,6 +472,7 @@ def save_uploaded_file(file, folder, allowed_extensions):
         'mime_type': mime_type
     }
 
+
 def get_upload_file_path(file_url):
     if not file_url or not file_url.startswith('/uploads/'):
         return None
@@ -371,6 +481,7 @@ def get_upload_file_path(file_url):
     if len(path_parts) != 2 or any(part in ('', '.', '..') for part in path_parts):
         return None
     return os.path.join(current_app.config['UPLOAD_FOLDER'], *path_parts)
+
 
 def delete_uploaded_file(file_url):
     if not file_url:
@@ -398,13 +509,13 @@ def delete_uploaded_file(file_url):
 
         uploaded_path = path.split('/upload/', 1)[1]
         path_parts = uploaded_path.split('/')
-        if path_parts and re.fullmatch(r'v\\d+', path_parts[0]):
+        if path_parts and re.fullmatch(r'v\d+', path_parts[0]):
             path_parts = path_parts[1:]
         if not path_parts:
             return False
 
         public_id_with_extension = '/'.join(path_parts)
-        public_id = re.sub(r'\\.[^.]+$', '', public_id_with_extension)
+        public_id = re.sub(r'\.[^.]+$', '', public_id_with_extension)
         resource_type = 'video' if '/video/upload/' in path else 'image'
 
         result = cloudinary.uploader.destroy(
@@ -417,6 +528,7 @@ def delete_uploaded_file(file_url):
         current_app.logger.exception("Cloudinary media deletion failed")
         return False
 
+
 def get_media_type(filename):
     ext = filename.rsplit('.', 1)[1].lower() if '.' in filename else ''
     image_exts = {'png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'tiff', 'ico'}
@@ -425,9 +537,11 @@ def get_media_type(filename):
     elif ext in video_exts: return 'video'
     return None
 
+
 def _slugify(text):
     slug = re.sub(r'[^a-z0-9]+', '-', (text or '').lower()).strip('-')
     return slug or f"park-{uuid.uuid4().hex[:8]}"
+
 
 def _unique_park_slug(base_slug, ignore_id=None):
     slug = base_slug
@@ -443,6 +557,7 @@ def _unique_park_slug(base_slug, ignore_id=None):
             q = q.filter(Park.id != ignore_id)
     return slug
 
+
 def _coerce_park_list(value):
     if value is None:
         return []
@@ -457,6 +572,7 @@ def _coerce_park_list(value):
             pass
         return [line.strip() for line in value.split('\n') if line.strip()]
     return []
+
 
 def _coerce_animal_stories(value):
     if value is None:
@@ -482,6 +598,7 @@ def _coerce_animal_stories(value):
                     out.append({'name': name.strip(), 'story': story.strip()})
         return out
     return []
+
 
 def _parse_park_payload():
     if request.content_type and 'multipart/form-data' in request.content_type:
@@ -518,33 +635,26 @@ def _parse_park_payload():
     incoming_gallery = _coerce_park_list(data.get('gallery'))
     return payload, hero_file, gallery_files, incoming_gallery
 
+
 def register_routes(app):
-    
+
     @app.route("/api/test-email", methods=["GET"])
+    @admin_required
     def test_email():
         try:
-            admin_email = os.environ.get('MAIL_ADMIN_RECIPIENT', 'info@joztembotours.com')
-            
-            # FORCE Resend Test domain to bypass config.py overrides
-            sender_email = "onboarding@resend.dev"
-            
-            html_body = generate_email_template(
-                "Test Email Successful!",
-                f"<p>Congratulations! Your HTML emails via Resend API are working perfectly.</p><p><b>Sender:</b> {sender_email}<br><b>Recipient:</b> {admin_email}</p>"
+            admin_email = get_admin_recipient()
+            send_email(
+                admin_email,
+                "TEST EMAIL FROM JOZTEMBO TOURS",
+                generate_email_template(
+                    "Test Email Successful!",
+                    f"<p>Resend is working.</p><p><b>Sender:</b> {escape(get_sender())}</p>"
+                ),
             )
-            
-            params = {
-                "from": f"Joz Tembo Tours <{sender_email}>",
-                "to": [admin_email],
-                "subject": "TEST EMAIL FROM JOZTEMBO TOURS (Resend API)",
-                "html": html_body
-            }
-            resend.Emails.send(params)
-            
-            return f"<h1>SUCCESS! The styled email was sent to {admin_email} via Resend.</h1><p>Check your inbox and spam folder.</p>", 200
+            return jsonify({'success': True, 'message': f'Test email sent to {admin_email}'}), 200
         except Exception as e:
-            app.logger.error(f"Test email failed: {str(e)}")
-            return f"<h1>FAILED TO SEND EMAIL</h1><p>Error: {str(e)}</p><p>Check your API key and domain verification.</p>", 500
+            app.logger.error(f"Test email failed: {e}")
+            return jsonify({'success': False, 'error': str(e)}), 500
 
     @app.route('/uploads/<path:folder>/<path:filename>')
     def serve_upload(folder, filename):
@@ -564,8 +674,7 @@ def register_routes(app):
             data = request.get_json()
             if not data.get('name') or not data.get('email') or not data.get('password'):
                 return jsonify({'success': False, 'error': 'Name, email, and password are required'}), 400
-            email_pattern = re.compile(r'^[^\s@]+@[^\s@]+\.[^\s@]+$')
-            if not email_pattern.match(data['email']):
+            if not EMAIL_REGEX.match(data['email']):
                 return jsonify({'success': False, 'error': 'Invalid email format'}), 400
             if len(data['password']) < 6:
                 return jsonify({'success': False, 'error': 'Password must be at least 6 characters'}), 400
@@ -1919,17 +2028,12 @@ def register_routes(app):
             db.session.rollback()
             return jsonify({'success': False, 'error': str(e)}), 500
 
-    # ================= PARKS (NEW) =================
+    # ================= PARKS =================
     @app.route("/api/parks", methods=["GET"])
     def get_parks():
         try:
-            parks = Park.query.filter_by(is_active=True)\
-                              .order_by(Park.display_order, Park.name).all()
-            return jsonify({
-                'success': True,
-                'count': len(parks),
-                'data': [p.to_dict() for p in parks]
-            }), 200
+            parks = Park.query.filter_by(is_active=True).order_by(Park.display_order, Park.name).all()
+            return jsonify({'success': True, 'count': len(parks), 'data': [p.to_dict() for p in parks]}), 200
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)}), 500
 
@@ -2000,7 +2104,6 @@ def register_routes(app):
 
             payload, hero_file, gallery_files, incoming_gallery = _parse_park_payload()
 
-            # If name changed, regenerate slug to keep URL stable-ish but unique
             if payload['name'] and payload['name'] != park.name:
                 base_slug = _slugify(payload['name'])
                 park.slug = _unique_park_slug(base_slug, ignore_id=park.id)
@@ -2013,7 +2116,6 @@ def register_routes(app):
                 url, _ = save_uploaded_file(hero_file, 'parks', allowed_exts)
                 if url: park.hero_image = url
 
-            # Merge gallery: incoming list + newly uploaded
             gallery_urls = list(incoming_gallery or park.gallery or [])
             for f in gallery_files:
                 if f and f.filename:
@@ -2046,7 +2148,7 @@ def register_routes(app):
             db.session.rollback()
             return jsonify({'success': False, 'error': str(e)}), 500
 
-    # ================= CONTACT / INQUIRIES =================
+    # ================= CONTACT / INQUIRIES (admin + customer both get emails) =================
     @app.route("/api/contact", methods=["POST"])
     @optional_auth
     def contact_form():
@@ -2055,95 +2157,66 @@ def register_routes(app):
             for field in ("name", "email", "message"):
                 if not data.get(field):
                     return jsonify({'success': False, 'error': f'{field} is required'}), 400
-            email_pattern = re.compile(r'^[^\s@]+@[^\s@]+\.[^\s@]+$')
-            if not email_pattern.match(str(data['email'])):
+            if not EMAIL_REGEX.match(str(data['email'])):
                 return jsonify({'success': False, 'error': 'Invalid email format'}), 400
             if len(str(data['message']).strip()) < 5:
                 return jsonify({'success': False, 'error': 'Message is too short'}), 400
-            name = data['name'].strip()
+
+            raw_name = data['name'].strip()
             email = data['email'].strip().lower()
-            phone = (data.get('phone') or '').strip()
-            subject = (data.get('subject') or 'General Inquiry').strip()
-            message = data['message'].strip()
-
-            admin_recipient = os.environ.get('MAIL_ADMIN_RECIPIENT', 'info@joztembotours.com')
-            sender = os.environ.get('MAIL_DEFAULT_SENDER', 'onboarding@resend.dev')
+            name = escape(raw_name)
+            phone = escape((data.get('phone') or '').strip())
+            raw_subject = (data.get('subject') or 'General Inquiry').strip()
+            subject = escape(raw_subject)
+            message = escape(data['message'].strip()).replace('\n', '<br>')
             ticket_id = f"JT-{uuid.uuid4().hex[:8].upper()}"
-
-            # Hardcoded fix to prevent config.py overrides
-            sender = "onboarding@resend.dev"
 
             admin_html = f"""
             <h3>New Contact Form Submission</h3>
             <p><strong>Name:</strong> {name}</p>
-            <p><strong>Email:</strong> {email}</p>
+            <p><strong>Email:</strong> {escape(email)}</p>
             <p><strong>Phone:</strong> {phone or '—'}</p>
             <p><strong>Subject:</strong> {subject}</p>
-            <div class="highlight-box">
-                <p><strong>Message:</strong></p>
-                <p>{message}</p>
-            </div>
+            <div class="highlight-box"><p><strong>Message:</strong></p><p>{message}</p></div>
             """
-            admin_msg_params = {
-                "from": f"Joz Tembo Tours <{sender}>",
-                "to": [admin_recipient],
-                "reply_to": email,
-                "subject": f"[{ticket_id}] {subject} — from {name}",
-                "html": generate_email_template(f"Contact Form: {ticket_id}", admin_html)
-            }
-            resend.Emails.send(admin_msg_params)
-
             customer_html = f"""
             <h3>Hi {name},</h3>
             <p>We have received your message and our team will get back to you within 24 hours.</p>
-            <p>Here is your reference number for your records:</p>
-            <div class="highlight-box" style="text-align: center; font-size: 18px;">
-                <strong>{ticket_id}</strong>
-            </div>
+            <p>Your reference number:</p>
+            <div class="highlight-box" style="text-align:center;font-size:18px;"><strong>{ticket_id}</strong></div>
             <p>Your message:</p>
-            <p style="color: #666; font-style: italic;">"{message}"</p>
+            <p style="color:#666;font-style:italic;">"{message}"</p>
             """
-            customer_msg_params = {
-                "from": f"Joz Tembo Tours <{sender}>",
-                # --- LOCAL TESTING FIX: Sending to admin instead of customer ---
-                "to": [admin_recipient], 
-                "subject": f"We received your message — {ticket_id}",
-                "html": generate_email_template("Message Received", customer_html)
-            }
-            resend.Emails.send(customer_msg_params)
 
-            app.logger.info(f"Contact form submitted: {ticket_id} from {email} ({subject})")
+            _, delivered = notify_both(
+                app, email, raw_name,
+                f"[{ticket_id}] {raw_subject} — from {raw_name}", admin_html, f"Contact Form: {ticket_id}",
+                f"We received your message — {ticket_id}", customer_html, "Message Received",
+            )
+            app.logger.info(f"Contact {ticket_id} from {email}; customer email delivered={delivered}")
             return jsonify({'success': True, 'message': 'Message sent successfully', 'ticket_id': ticket_id}), 201
         except Exception as e:
             app.logger.error(f"Contact form error: {e}")
-            return jsonify({'success': False, 'error': f'Failed to send message: {str(e)}'}), 500
+            return jsonify({'success': False, 'error': 'Failed to send message. Please try again.'}), 500
 
     @app.route("/api/transfer-quick-inquiry", methods=["POST"])
     def create_quick_transfer_inquiry():
         try:
             data = request.get_json(silent=True) or {}
-
-            required_fields = (
-                "name", "email", "phone", "pickup_location",
-                "dropoff_location", "date_time", "transfer_type"
-            )
-            missing = [field for field in required_fields if not str(data.get(field, "")).strip()]
+            required_fields = ("name", "email", "phone", "pickup_location",
+                               "dropoff_location", "date_time", "transfer_type")
+            missing = [f for f in required_fields if not str(data.get(f, "")).strip()]
             if missing:
-                return jsonify({
-                    "success": False,
-                    "error": f"Please complete all required fields: {', '.join(missing)}"
-                }), 400
+                return jsonify({"success": False, "error": f"Please complete all required fields: {', '.join(missing)}"}), 400
 
             email = str(data["email"]).strip().lower()
-            email_pattern = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
-            if not email_pattern.match(email):
+            if not EMAIL_REGEX.match(email):
                 return jsonify({"success": False, "error": "Please enter a valid email address."}), 400
 
             try:
                 pax = int(data.get("passengers", 1))
             except (TypeError, ValueError):
                 return jsonify({"success": False, "error": "Passenger count must be a number."}), 400
-
             if pax < 1 or pax > 20:
                 return jsonify({"success": False, "error": "Passenger count must be between 1 and 20."}), 400
 
@@ -2152,94 +2225,62 @@ def register_routes(app):
                 return jsonify({"success": False, "error": "Please select a valid transfer type."}), 400
 
             reference_code = f"JT-TRF-{uuid.uuid4().hex[:6].upper()}"
-            name = escape(str(data["name"]).strip())
+            raw_name = str(data["name"]).strip()
+            name = escape(raw_name)
             phone = escape(str(data["phone"]).strip())
             pickup = escape(str(data["pickup_location"]).strip())
             dropoff = escape(str(data["dropoff_location"]).strip())
             date_time = escape(str(data["date_time"]).strip())
             transfer_label = "Airport to Hotel" if transfer_type == "airport-to-hotel" else "Hotel to Airport"
-            admin_recipient = os.environ.get("MAIL_ADMIN_RECIPIENT", "info@joztembotours.com")
-            
-            # Hardcoded fix to prevent config.py overrides
-            sender = "onboarding@resend.dev"
 
+            row = 'style="padding:10px 0;color:#777;border-bottom:1px solid #eee;"'
+            val = 'style="padding:10px 0;text-align:right;border-bottom:1px solid #eee;"'
             details_html = f"""
-                <table role="presentation" width="100%" cellpadding="0" cellspacing="0"
-                       style="border-collapse:collapse;font-size:14px;">
-                    <tr><td style="padding:10px 0;color:#777;border-bottom:1px solid #eee;">Reference</td>
-                        <td style="padding:10px 0;text-align:right;font-weight:bold;border-bottom:1px solid #eee;">{reference_code}</td></tr>
-                    <tr><td style="padding:10px 0;color:#777;border-bottom:1px solid #eee;">Transfer type</td>
-                        <td style="padding:10px 0;text-align:right;border-bottom:1px solid #eee;">{transfer_label}</td></tr>
-                    <tr><td style="padding:10px 0;color:#777;border-bottom:1px solid #eee;">Pickup location</td>
-                        <td style="padding:10px 0;text-align:right;border-bottom:1px solid #eee;">{pickup}</td></tr>
-                    <tr><td style="padding:10px 0;color:#777;border-bottom:1px solid #eee;">Drop-off location</td>
-                        <td style="padding:10px 0;text-align:right;border-bottom:1px solid #eee;">{dropoff}</td></tr>
-                    <tr><td style="padding:10px 0;color:#777;border-bottom:1px solid #eee;">Date &amp; time</td>
-                        <td style="padding:10px 0;text-align:right;border-bottom:1px solid #eee;">{date_time}</td></tr>
-                    <tr><td style="padding:10px 0;color:#777;border-bottom:1px solid #eee;">Passengers</td>
-                        <td style="padding:10px 0;text-align:right;border-bottom:1px solid #eee;">{pax}</td></tr>
-                    <tr><td style="padding:10px 0;color:#777;border-bottom:1px solid #eee;">Customer name</td>
-                        <td style="padding:10px 0;text-align:right;border-bottom:1px solid #eee;">{name}</td></tr>
-                    <tr><td style="padding:10px 0;color:#777;">Phone</td>
-                        <td style="padding:10px 0;text-align:right;">{phone}</td></tr>
-                </table>
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-size:14px;">
+                <tr><td {row}>Reference</td><td {val}><strong>{reference_code}</strong></td></tr>
+                <tr><td {row}>Transfer type</td><td {val}>{transfer_label}</td></tr>
+                <tr><td {row}>Pickup location</td><td {val}>{pickup}</td></tr>
+                <tr><td {row}>Drop-off location</td><td {val}>{dropoff}</td></tr>
+                <tr><td {row}>Date &amp; time</td><td {val}>{date_time}</td></tr>
+                <tr><td {row}>Passengers</td><td {val}>{pax}</td></tr>
+                <tr><td {row}>Customer name</td><td {val}>{name}</td></tr>
+                <tr><td {row}>Email</td><td {val}>{escape(email)}</td></tr>
+                <tr><td style="padding:10px 0;color:#777;">Phone</td><td style="padding:10px 0;text-align:right;">{phone}</td></tr>
+            </table>
             """
-
             admin_html = f"""
-                <p style="margin-top:0;">A new transfer request has been submitted through the website.</p>
-                <div class="highlight-box">
-                    <strong>New transfer inquiry · {reference_code}</strong>
-                </div>
-                {details_html}
-                <p style="margin-top:22px;">Reply directly to this email to contact the customer at {escape(email)}.</p>
+            <p style="margin-top:0;">A new transfer request has been submitted through the website.</p>
+            <div class="highlight-box"><strong>New transfer inquiry · {reference_code}</strong></div>
+            {details_html}
+            <p style="margin-top:22px;">Reply directly to this email to contact the customer.</p>
             """
-            admin_message_params = {
-                "from": f"Joz Tembo Tours <{sender}>",
-                "to": [admin_recipient],
-                "reply_to": email,
-                "subject": f"[{reference_code}] New transfer request — {name}",
-                "html": generate_email_template("New Transfer Request", admin_html)
-            }
-            resend.Emails.send(admin_message_params)
-
             customer_html = f"""
-                <p>Hello {name},</p>
-                <p>Thank you for choosing <strong>Joz Tembo Tours &amp; Safari</strong>.
-                   We have successfully received your transfer request.</p>
-                <div class="highlight-box" style="text-align:center;">
-                    <p style="margin:0 0 6px;color:#777;font-size:12px;text-transform:uppercase;letter-spacing:1px;">
-                        Your reference number
-                    </p>
-                    <strong style="font-size:22px;letter-spacing:1px;">{reference_code}</strong>
-                </div>
-                <h3 style="margin-bottom:10px;">Your request summary</h3>
-                {details_html}
-                <p style="margin-top:22px;">Our team will review your request and contact you to confirm availability and pricing.</p>
-                <p>We look forward to making your journey comfortable and seamless.</p>
-                <p style="margin-bottom:0;"><strong>Joz Tembo Tours &amp; Safari</strong></p>
+            <p>Hello {name},</p>
+            <p>Thank you for choosing <strong>Joz Tembo Tours &amp; Safari</strong>. We have received your transfer request.</p>
+            <div class="highlight-box" style="text-align:center;">
+                <p style="margin:0 0 6px;color:#777;font-size:12px;text-transform:uppercase;">Your reference number</p>
+                <strong style="font-size:22px;">{reference_code}</strong>
+            </div>
+            <h3>Your request summary</h3>
+            {details_html}
+            <p style="margin-top:22px;">Our team will contact you to confirm availability and pricing.</p>
+            <p><strong>Joz Tembo Tours &amp; Safari</strong></p>
             """
-            customer_message_params = {
-                "from": f"Joz Tembo Tours <{sender}>",
-                # --- LOCAL TESTING FIX: Sending to admin instead of customer ---
-                "to": [admin_recipient], 
-                "subject": f"Transfer request received — {reference_code}",
-                "html": generate_email_template("We’ve Received Your Request", customer_html)
-            }
-            resend.Emails.send(customer_message_params)
 
-            app.logger.info("Quick transfer inquiry %s received from %s", reference_code, email)
+            _, delivered = notify_both(
+                app, email, raw_name,
+                f"[{reference_code}] New transfer request — {raw_name}", admin_html, "New Transfer Request",
+                f"Transfer request received — {reference_code}", customer_html, "We’ve Received Your Request",
+            )
+            app.logger.info(f"Transfer {reference_code} from {email}; customer email delivered={delivered}")
             return jsonify({
                 "success": True,
                 "message": "Your transfer request has been received successfully.",
                 "reference_code": reference_code
             }), 201
-
         except Exception as e:
-            app.logger.exception("Quick transfer inquiry email failed")
-            return jsonify({
-                "success": False,
-                "error": f"We could not send your request right now: {str(e)}"
-            }), 500
+            app.logger.exception("Quick transfer inquiry failed")
+            return jsonify({"success": False, "error": "We could not send your request right now. Please try again."}), 500
 
     @app.route("/api/inquiries", methods=["POST"])
     @optional_auth
@@ -2247,107 +2288,110 @@ def register_routes(app):
         try:
             data = request.get_json() or {}
             for field in ('type', 'item_id', 'name', 'email'):
-                if not data.get(field): return jsonify({'success': False, 'error': f'{field} is required'}), 400
-            email_pattern = re.compile(r'^[^\s@]+@[^\s@]+\.[^\s@]+$')
-            if not email_pattern.match(str(data['email'])): return jsonify({'success': False, 'error': 'Invalid email format'}), 400
+                if not data.get(field):
+                    return jsonify({'success': False, 'error': f'{field} is required'}), 400
+            if not EMAIL_REGEX.match(str(data['email'])):
+                return jsonify({'success': False, 'error': 'Invalid email format'}), 400
 
             ref_prefix = {'package': 'PKG', 'excursion': 'EXC', 'transfer': 'TRF'}.get(data['type'], 'INQ')
             reference_code = f"JT-{ref_prefix}-{uuid.uuid4().hex[:6].upper()}"
+            pax = parse_pax(data.get('pax'))
+            pax_label = f"{pax}+" if str(data.get('pax', '')).strip().endswith('+') else str(pax)
 
             unit_price = 0.0
             currency = 'USD'
             resolved_name = data.get('item_name') or 'N/A'
             pricing_label = None
+
             if data['type'] == 'excursion':
                 exc = Excursion.query.filter_by(id=data['item_id'], is_active=True).first()
-                if not exc: return jsonify({'success': False, 'error': 'Excursion not found'}), 404
+                if not exc:
+                    return jsonify({'success': False, 'error': 'Excursion not found'}), 404
                 unit_price = float(exc.price or 0)
                 currency = exc.price_currency or 'USD'
                 resolved_name = exc.name
+
             elif data['type'] == 'package':
                 pkg = Package.query.filter_by(id=data['item_id'], is_active=True).first()
-                if not pkg: return jsonify({'success': False, 'error': 'Package not found'}), 404
+                if not pkg:
+                    return jsonify({'success': False, 'error': 'Package not found'}), 404
                 resolved_name = pkg.name
                 p = pkg.prices or {}
-                pax_n = max(1, int(data.get('pax') or 1))
                 tier_rates = {2: p.get('pax_2'), 4: p.get('pax_4'), 6: p.get('pax_6')}
                 chosen_rate = None
-                if pax_n <= 2 and tier_rates[2]:
+                if pax <= 2 and tier_rates[2]:
                     chosen_rate = float(tier_rates[2])
                     pricing_label = f"2-pax rate ({currency} {chosen_rate:,.0f}/person)"
-                elif pax_n <= 4 and (tier_rates[4] or tier_rates[2]):
-                    r = tier_rates[4] or tier_rates[2]
-                    chosen_rate = float(r)
+                elif pax <= 4 and (tier_rates[4] or tier_rates[2]):
+                    chosen_rate = float(tier_rates[4] or tier_rates[2])
                     pricing_label = f"4-pax rate ({currency} {chosen_rate:,.0f}/person)"
-                elif pax_n <= 6 and (tier_rates[6] or tier_rates[4] or tier_rates[2]):
-                    r = tier_rates[6] or tier_rates[4] or tier_rates[2]
-                    chosen_rate = float(r)
+                elif pax <= 6 and (tier_rates[6] or tier_rates[4] or tier_rates[2]):
+                    chosen_rate = float(tier_rates[6] or tier_rates[4] or tier_rates[2])
                     pricing_label = f"6-pax rate ({currency} {chosen_rate:,.0f}/person)"
-                else: pricing_label = "NEGOTIABLE — custom group rate"
+                else:
+                    pricing_label = "NEGOTIABLE — custom group rate"
                 unit_price = chosen_rate if chosen_rate else 0.0
+
             elif data['type'] == 'transfer':
                 t = Transfer.query.filter_by(id=data['item_id'], is_active=True).first()
-                if not t: return jsonify({'success': False, 'error': 'Transfer route not found'}), 404
+                if not t:
+                    return jsonify({'success': False, 'error': 'Transfer route not found'}), 404
                 resolved_name = t.route
                 currency = t.currency or 'EUR'
-                pax_n = max(1, int(data.get('pax') or 1))
-                if pax_n <= 2: chosen_rate = t.price_2_pax
-                elif pax_n <= 4: chosen_rate = t.price_4_pax or t.price_2_pax
+                if pax <= 2: chosen_rate = t.price_2_pax
+                elif pax <= 4: chosen_rate = t.price_4_pax or t.price_2_pax
                 else: chosen_rate = t.price_6_pax or t.price_4_pax or t.price_2_pax
                 unit_price = float(chosen_rate or 0)
-                pricing_label = f"Transfer tier for {pax_n} pax"
-            else: return jsonify({'success': False, 'error': 'Invalid inquiry type'}), 400
+                pricing_label = f"Transfer tier for {pax} pax"
+            else:
+                return jsonify({'success': False, 'error': 'Invalid inquiry type'}), 400
 
-            pax = max(1, int(data.get('pax') or 1))
             price_estimate = unit_price * pax
-            admin_recipient = os.environ.get('MAIL_ADMIN_RECIPIENT', 'info@joztembotours.com')
-            
-            # Hardcoded fix to prevent config.py overrides
-            sender = "onboarding@resend.dev"
+
+            raw_name = str(data['name']).strip()
+            name = escape(raw_name)
+            email = str(data['email']).strip().lower()
+            phone = escape(str(data.get('phone') or '—'))
+            travel_date = escape(str(data.get('date') or 'Not specified'))
+            message = escape(str(data.get('message') or 'No message provided.')).replace('\n', '<br>')
+            item = escape(str(resolved_name))
+            inquiry_type = escape(str(data['type']).title())
+            price_text = f"{price_estimate:,.2f} {currency}" if unit_price else "To be confirmed"
 
             admin_html = f"""
-            <h3>New {data['type'].title()} Inquiry</h3>
+            <h3>New {inquiry_type} Inquiry</h3>
             <p><strong>Reference:</strong> {reference_code}</p>
-            <p><strong>Item:</strong> {resolved_name}</p>
-            <p><strong>Name:</strong> {data['name']}</p>
-            <p><strong>Email:</strong> {data['email']}</p>
-            <p><strong>Phone:</strong> {data.get('phone', '—')}</p>
-            <p><strong>Pax:</strong> {pax}</p>
-            <p><strong>Pricing:</strong> {pricing_label or 'n/a'}</p>
-            <div class="highlight-box">
-                <p><strong>Estimated Price:</strong> {price_estimate:,.2f} {currency}</p>
-            </div>
+            <p><strong>Item:</strong> {item}</p>
+            <p><strong>Name:</strong> {name}</p>
+            <p><strong>Email:</strong> {escape(email)}</p>
+            <p><strong>Phone:</strong> {phone}</p>
+            <p><strong>Travel date:</strong> {travel_date}</p>
+            <p><strong>Guests:</strong> {escape(pax_label)}</p>
+            <p><strong>Pricing:</strong> {escape(pricing_label or 'n/a')}</p>
+            <div class="highlight-box"><p><strong>Estimated price:</strong> {price_text}</p></div>
             <p><strong>Message:</strong></p>
-            <p style="color: #666; font-style: italic;">"{data.get('message', 'No message provided.')}"</p>
+            <p style="color:#666;font-style:italic;">"{message}"</p>
             """
-            msg_params = {
-                "from": f"Joz Tembo Tours <{sender}>",
-                "to": [admin_recipient],
-                "reply_to": data['email'],
-                "subject": f"[{reference_code}] New {data['type'].title()} Inquiry — {resolved_name}",
-                "html": generate_email_template(f"Inquiry: {reference_code}", admin_html)
-            }
-            resend.Emails.send(msg_params)
-
             customer_html = f"""
-            <h3>Hi {data['name']},</h3>
-            <p>Our team is currently working on your inquiry for <strong>{resolved_name}</strong>. We will get back to you shortly with more details.</p>
+            <h3>Hi {name},</h3>
+            <p>Thank you for your inquiry about <strong>{item}</strong>. Our team will get back to you within 24 hours.</p>
             <div class="highlight-box">
-                <p><strong>Reference Number:</strong> {reference_code}</p>
-                <p><strong>Route/Item:</strong> {resolved_name}</p>
-                <p><strong>Estimated Price:</strong> {price_estimate:,.2f} {currency}</p>
-                <p><strong>Pricing Details:</strong> {pricing_label or 'Custom Group Rate'}</p>
+                <p><strong>Reference number:</strong> {reference_code}</p>
+                <p><strong>Item:</strong> {item}</p>
+                <p><strong>Travel date:</strong> {travel_date}</p>
+                <p><strong>Guests:</strong> {escape(pax_label)}</p>
+                <p><strong>Estimated price:</strong> {price_text}</p>
+                <p><strong>Pricing details:</strong> {escape(pricing_label or 'Custom group rate')}</p>
             </div>
             <p>Thank you for considering Joz Tembo Tours for your safari adventure.</p>
             """
-            confirm_params = {
-                "from": f"Joz Tembo Tours <{sender}>",
-                # --- LOCAL TESTING FIX: Sending to admin instead of customer ---
-                "to": [admin_recipient], 
-                "subject": f"We received your inquiry — {reference_code}",
-                "html": generate_email_template("Inquiry Received", customer_html)
-            }
-            resend.Emails.send(confirm_params)
+
+            _, delivered = notify_both(
+                app, email, raw_name,
+                f"[{reference_code}] New {str(data['type']).title()} Inquiry — {resolved_name}", admin_html, f"Inquiry: {reference_code}",
+                f"We received your inquiry — {reference_code}", customer_html, "Inquiry Received",
+            )
+            app.logger.info(f"Inquiry {reference_code} from {email}; customer email delivered={delivered}")
 
             return jsonify({
                 'success': True,
@@ -2360,13 +2404,12 @@ def register_routes(app):
             }), 201
         except Exception as e:
             app.logger.error(f"Inquiry error: {e}")
-            return jsonify({'success': False, 'error': f'Inquiry failed: {str(e)}'}), 500
+            return jsonify({'success': False, 'error': 'Inquiry failed. Please try again.'}), 500
 
     @app.route("/")
     def index():
-        return jsonify({"message": "🦁 Joztembo Tours - Backend API (Resend API)", "version": "4.0"}), 200
+        return jsonify({"message": "🦁 Joztembo Tours - Backend API (Resend API)", "version": "4.1"}), 200
 
-load_dotenv()
 
 app = create_app()
 
